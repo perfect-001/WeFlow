@@ -1,5 +1,6 @@
 // 配置服务 - 封装 Electron Store
 import { config } from './ipc'
+import type { ExportDefaultDateRangeConfig } from '../utils/exportDateRange'
 
 // 配置键名
 export const CONFIG_KEYS = {
@@ -26,6 +27,7 @@ export const CONFIG_KEYS = {
   AUTO_TRANSCRIBE_VOICE: 'autoTranscribeVoice',
   TRANSCRIBE_LANGUAGES: 'transcribeLanguages',
   EXPORT_DEFAULT_FORMAT: 'exportDefaultFormat',
+  EXPORT_DEFAULT_AVATARS: 'exportDefaultAvatars',
   EXPORT_DEFAULT_DATE_RANGE: 'exportDefaultDateRange',
   EXPORT_DEFAULT_MEDIA: 'exportDefaultMedia',
   EXPORT_DEFAULT_VOICE_AS_TEXT: 'exportDefaultVoiceAsText',
@@ -41,6 +43,7 @@ export const CONFIG_KEYS = {
   EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
   EXPORT_SESSION_CONTENT_METRIC_CACHE_MAP: 'exportSessionContentMetricCacheMap',
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
+  EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP: 'exportSnsUserPostCountsCacheMap',
   SNS_PAGE_CACHE_MAP: 'snsPageCacheMap',
   CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
   CONTACTS_LIST_CACHE_MAP: 'contactsListCacheMap',
@@ -73,6 +76,20 @@ export interface WxidConfig {
   imageXorKey?: number
   imageAesKey?: string
   updatedAt?: number
+}
+
+export interface ExportDefaultMediaConfig {
+  images: boolean
+  videos: boolean
+  voices: boolean
+  emojis: boolean
+}
+
+const DEFAULT_EXPORT_MEDIA_CONFIG: ExportDefaultMediaConfig = {
+  images: true,
+  videos: true,
+  voices: true,
+  emojis: true
 }
 
 // 获取解密密钥
@@ -333,27 +350,64 @@ export async function setExportDefaultFormat(format: string): Promise<void> {
   await config.set(CONFIG_KEYS.EXPORT_DEFAULT_FORMAT, format)
 }
 
-// 获取导出默认时间范围
-export async function getExportDefaultDateRange(): Promise<string | null> {
-  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE)
-  return (value as string) || null
-}
-
-// 设置导出默认时间范围
-export async function setExportDefaultDateRange(range: string): Promise<void> {
-  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
-}
-
-// 获取导出默认媒体设置
-export async function getExportDefaultMedia(): Promise<boolean | null> {
-  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
+// 获取导出默认头像设置
+export async function getExportDefaultAvatars(): Promise<boolean | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS)
   if (typeof value === 'boolean') return value
   return null
 }
 
+// 设置导出默认头像设置
+export async function setExportDefaultAvatars(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_AVATARS, enabled)
+}
+
+// 获取导出默认时间范围
+export async function getExportDefaultDateRange(): Promise<ExportDefaultDateRangeConfig | string | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE)
+  if (typeof value === 'string') return value
+  if (value && typeof value === 'object') {
+    return value as ExportDefaultDateRangeConfig
+  }
+  return null
+}
+
+// 设置导出默认时间范围
+export async function setExportDefaultDateRange(range: ExportDefaultDateRangeConfig | string): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_DATE_RANGE, range)
+}
+
+// 获取导出默认媒体设置
+export async function getExportDefaultMedia(): Promise<ExportDefaultMediaConfig | null> {
+  const value = await config.get(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA)
+  if (typeof value === 'boolean') {
+    return {
+      images: value,
+      videos: value,
+      voices: value,
+      emojis: value
+    }
+  }
+  if (value && typeof value === 'object') {
+    const raw = value as Partial<Record<keyof ExportDefaultMediaConfig, unknown>>
+    return {
+      images: typeof raw.images === 'boolean' ? raw.images : DEFAULT_EXPORT_MEDIA_CONFIG.images,
+      videos: typeof raw.videos === 'boolean' ? raw.videos : DEFAULT_EXPORT_MEDIA_CONFIG.videos,
+      voices: typeof raw.voices === 'boolean' ? raw.voices : DEFAULT_EXPORT_MEDIA_CONFIG.voices,
+      emojis: typeof raw.emojis === 'boolean' ? raw.emojis : DEFAULT_EXPORT_MEDIA_CONFIG.emojis
+    }
+  }
+  return null
+}
+
 // 设置导出默认媒体设置
-export async function setExportDefaultMedia(enabled: boolean): Promise<void> {
-  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA, enabled)
+export async function setExportDefaultMedia(media: ExportDefaultMediaConfig): Promise<void> {
+  await config.set(CONFIG_KEYS.EXPORT_DEFAULT_MEDIA, {
+    images: media.images,
+    videos: media.videos,
+    voices: media.voices,
+    emojis: media.emojis
+  })
 }
 
 // 获取导出默认语音转文字
@@ -532,6 +586,11 @@ export interface ExportSnsStatsCacheItem {
   updatedAt: number
   totalPosts: number
   totalFriends: number
+}
+
+export interface ExportSnsUserPostCountsCacheItem {
+  updatedAt: number
+  counts: Record<string, number>
 }
 
 export interface SnsPageOverviewCache {
@@ -739,6 +798,58 @@ export async function setExportSnsStatsCache(
   }
 
   await config.set(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP, map)
+}
+
+export async function getExportSnsUserPostCountsCache(scopeKey: string): Promise<ExportSnsUserPostCountsCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const raw = rawItem as Record<string, unknown>
+  const rawCounts = raw.counts
+  if (!rawCounts || typeof rawCounts !== 'object') return null
+
+  const counts: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(rawCounts as Record<string, unknown>)) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    counts[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
+    ? raw.updatedAt
+    : 0
+  return { updatedAt, counts }
+}
+
+export async function setExportSnsUserPostCountsCache(
+  scopeKey: string,
+  counts: Record<string, number>
+): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: Record<string, number> = {}
+  for (const [rawUsername, rawCount] of Object.entries(counts || {})) {
+    const username = String(rawUsername || '').trim()
+    if (!username) continue
+    const valueNum = Number(rawCount)
+    normalized[username] = Number.isFinite(valueNum) ? Math.max(0, Math.floor(valueNum)) : 0
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    counts: normalized
+  }
+
+  await config.set(CONFIG_KEYS.EXPORT_SNS_USER_POST_COUNTS_CACHE_MAP, map)
 }
 
 export async function getSnsPageCache(scopeKey: string): Promise<SnsPageCacheItem | null> {

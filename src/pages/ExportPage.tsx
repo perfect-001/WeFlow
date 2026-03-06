@@ -38,6 +38,19 @@ import {
   onOpenSingleExport
 } from '../services/exportBridge'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
+import { SnsPostItem } from '../components/Sns/SnsPostItem'
+import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
+import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
+import { ExportDefaultsSettingsForm, type ExportDefaultsSettingsPatch } from '../components/Export/ExportDefaultsSettingsForm'
+import type { SnsPost } from '../types/sns'
+import {
+  cloneExportDateRange,
+  createDefaultDateRange,
+  createDefaultExportDateRangeSelection,
+  getExportDateRangeLabel,
+  resolveExportDateRangeConfig,
+  type ExportDateRangeSelection
+} from '../utils/exportDateRange'
 import './ExportPage.scss'
 
 type ConversationTab = 'private' | 'group' | 'official' | 'former_friend'
@@ -45,21 +58,11 @@ type TaskStatus = 'queued' | 'running' | 'success' | 'error'
 type TaskScope = 'single' | 'multi' | 'content' | 'sns'
 type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji'
 type ContentCardType = ContentType | 'sns'
+type SnsRankMode = 'likes' | 'comments'
 
 type SessionLayout = 'shared' | 'per-session'
 
 type DisplayNamePreference = 'group-nickname' | 'remark' | 'nickname'
-type DateRangePreset =
-  | 'all'
-  | 'today'
-  | 'yesterday'
-  | 'last3days'
-  | 'last7days'
-  | 'last30days'
-  | 'last1year'
-  | 'last2years'
-  | 'custom'
-type CalendarCell = { date: Date; inCurrentMonth: boolean }
 
 type TextExportFormat = 'chatlab' | 'chatlab-jsonl' | 'json' | 'arkme-json' | 'html' | 'txt' | 'excel' | 'weclone' | 'sql'
 type SnsTimelineExportFormat = 'json' | 'html' | 'arkmejson'
@@ -154,21 +157,30 @@ interface ExportDialogState {
   title: string
 }
 
-interface TimeRangeDialogDraft {
-  preset: DateRangePreset
-  useAllTime: boolean
-  dateRange: { start: Date; end: Date }
-  startPanelMonth: Date
-  endPanelMonth: Date
-}
-
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
+const DETAIL_PRECISE_REFRESH_COOLDOWN_MS = 10 * 60 * 1000
+const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
+const SESSION_MEDIA_METRIC_BATCH_SIZE = 12
+const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
+const SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS = 120
+const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
+const SNS_USER_POST_COUNT_BATCH_SIZE = 12
+const SNS_USER_POST_COUNT_BATCH_INTERVAL_MS = 120
+const SNS_RANK_PAGE_SIZE = 50
+const SNS_RANK_DISPLAY_LIMIT = 15
 const contentTypeLabels: Record<ContentType, string> = {
   text: '聊天文本',
   voice: '语音',
   image: '图片',
   video: '视频',
   emoji: '表情包'
+}
+
+const conversationTabLabels: Record<ConversationTab, string> = {
+  private: '私聊',
+  group: '群聊',
+  official: '公众号',
+  former_friend: '曾经的好友'
 }
 
 const getContentTypeLabel = (type: ContentType): string => {
@@ -409,6 +421,14 @@ const formatYmdHmDateTime = (timestamp?: number): string => {
   return `${y}-${m}-${day} ${h}:${min}`
 }
 
+const isSingleContactSession = (sessionId: string): boolean => {
+  const normalized = String(sessionId || '').trim()
+  if (!normalized) return false
+  if (normalized.includes('@chatroom')) return false
+  if (normalized.startsWith('gh_')) return false
+  return true
+}
+
 const formatPathBrief = (value: string, maxLength = 52): string => {
   const normalized = String(value || '')
   if (normalized.length <= maxLength) return normalized
@@ -434,126 +454,6 @@ const formatRecentExportTime = (timestamp?: number, now = Date.now()): string =>
   return formatAbsoluteDate(timestamp)
 }
 
-const startOfDay = (date: Date): Date => {
-  const next = new Date(date)
-  next.setHours(0, 0, 0, 0)
-  return next
-}
-
-const endOfDay = (date: Date): Date => {
-  const next = new Date(date)
-  next.setHours(23, 59, 59, 999)
-  return next
-}
-
-const createDefaultDateRange = (): { start: Date; end: Date } => {
-  const now = new Date()
-  return {
-    start: startOfDay(now),
-    end: now
-  }
-}
-
-const createDateRangeByPreset = (
-  preset: Exclude<DateRangePreset, 'all' | 'custom'>,
-  now = new Date()
-): { start: Date; end: Date } => {
-  const end = new Date(now)
-  const baseStart = startOfDay(now)
-
-  if (preset === 'today') {
-    return { start: baseStart, end }
-  }
-
-  if (preset === 'yesterday') {
-    const yesterday = new Date(baseStart)
-    yesterday.setDate(yesterday.getDate() - 1)
-    return {
-      start: yesterday,
-      end: endOfDay(yesterday)
-    }
-  }
-
-  if (preset === 'last1year' || preset === 'last2years') {
-    const yearsBack = preset === 'last1year' ? 1 : 2
-    const start = new Date(baseStart)
-    const expectedMonth = start.getMonth()
-    start.setFullYear(start.getFullYear() - yearsBack)
-    // Handle leap-year fallback (e.g. Feb 29 -> Feb 28).
-    if (start.getMonth() !== expectedMonth) {
-      start.setDate(0)
-    }
-    return { start, end }
-  }
-
-  const daysBack = preset === 'last3days' ? 2 : preset === 'last7days' ? 6 : 29
-  const start = new Date(baseStart)
-  start.setDate(start.getDate() - daysBack)
-  return { start, end }
-}
-
-const formatDateInputValue = (date: Date): string => {
-  const y = date.getFullYear()
-  const m = `${date.getMonth() + 1}`.padStart(2, '0')
-  const d = `${date.getDate()}`.padStart(2, '0')
-  return `${y}-${m}-${d}`
-}
-
-const parseDateInputValue = (raw: string): Date | null => {
-  const text = String(raw || '').trim()
-  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text)
-  if (!matched) return null
-  const year = Number(matched[1])
-  const month = Number(matched[2])
-  const day = Number(matched[3])
-  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null
-  if (month < 1 || month > 12 || day < 1 || day > 31) return null
-  const parsed = new Date(year, month - 1, day)
-  if (
-    parsed.getFullYear() !== year ||
-    parsed.getMonth() !== month - 1 ||
-    parsed.getDate() !== day
-  ) {
-    return null
-  }
-  return parsed
-}
-
-const toMonthStart = (date: Date): Date => new Date(date.getFullYear(), date.getMonth(), 1)
-
-const addMonths = (date: Date, delta: number): Date => {
-  const next = new Date(date)
-  next.setMonth(next.getMonth() + delta)
-  return toMonthStart(next)
-}
-
-const isSameDay = (left: Date, right: Date): boolean => (
-  left.getFullYear() === right.getFullYear() &&
-  left.getMonth() === right.getMonth() &&
-  left.getDate() === right.getDate()
-)
-
-const buildCalendarCells = (monthStart: Date): CalendarCell[] => {
-  const firstDay = new Date(monthStart.getFullYear(), monthStart.getMonth(), 1)
-  const startOffset = firstDay.getDay()
-  const gridStart = new Date(firstDay)
-  gridStart.setDate(gridStart.getDate() - startOffset)
-  const cells: CalendarCell[] = []
-  for (let index = 0; index < 42; index += 1) {
-    const current = new Date(gridStart)
-    current.setDate(gridStart.getDate() + index)
-    cells.push({
-      date: current,
-      inCurrentMonth: current.getMonth() === monthStart.getMonth()
-    })
-  }
-  return cells
-}
-
-const formatCalendarMonthTitle = (date: Date): string => `${date.getFullYear()}年${date.getMonth() + 1}月`
-
-const WEEKDAY_SHORT_LABELS = ['日', '一', '二', '三', '四', '五', '六']
-
 const toKindByContactType = (session: AppChatSession, contact?: ContactInfo): ConversationTab => {
   if (session.username.endsWith('@chatroom')) return 'group'
   if (session.username.startsWith('gh_')) return 'official'
@@ -573,6 +473,10 @@ const isContentScopeSession = (session: SessionRow): boolean => (
   session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
 )
 
+const isExportConversationSession = (session: SessionRow): boolean => (
+  session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
+)
+
 const exportKindPriority: Record<ConversationTab, number> = {
   private: 0,
   group: 1,
@@ -583,6 +487,16 @@ const exportKindPriority: Record<ConversationTab, number> = {
 const getAvatarLetter = (name: string): string => {
   if (!name) return '?'
   return [...name][0] || '?'
+}
+
+const toComparableNameSet = (values: Array<string | undefined | null>): Set<string> => {
+  const set = new Set<string>()
+  for (const value of values) {
+    const normalized = String(value || '').trim()
+    if (!normalized) continue
+    set.add(normalized)
+  }
+  return set
 }
 
 const matchesContactTab = (contact: ContactInfo, tab: ConversationTab): boolean => {
@@ -648,6 +562,202 @@ interface SessionDetail {
   messageTables: { dbName: string; tableName: string; count: number }[]
 }
 
+interface SessionSnsTimelineTarget {
+  username: string
+  displayName: string
+  avatarUrl?: string
+}
+
+interface SessionSnsRankItem {
+  name: string
+  count: number
+  latestTime: number
+}
+
+type SessionMutualFriendDirection = 'incoming' | 'outgoing' | 'bidirectional'
+type SessionMutualFriendBehavior = 'likes' | 'comments' | 'both'
+
+interface SessionMutualFriendItem {
+  name: string
+  incomingLikeCount: number
+  incomingCommentCount: number
+  outgoingLikeCount: number
+  outgoingCommentCount: number
+  totalCount: number
+  latestTime: number
+  direction: SessionMutualFriendDirection
+  behavior: SessionMutualFriendBehavior
+}
+
+interface SessionMutualFriendsMetric {
+  count: number
+  items: SessionMutualFriendItem[]
+  loadedPosts: number
+  totalPosts: number | null
+  computedAt: number
+}
+
+interface SessionSnsRankCacheEntry {
+  likes: SessionSnsRankItem[]
+  comments: SessionSnsRankItem[]
+  totalPosts: number
+  computedAt: number
+}
+
+const buildSessionSnsRankings = (posts: SnsPost[]): { likes: SessionSnsRankItem[]; comments: SessionSnsRankItem[] } => {
+  const likeMap = new Map<string, SessionSnsRankItem>()
+  const commentMap = new Map<string, SessionSnsRankItem>()
+
+  for (const post of posts) {
+    const createTime = Number(post?.createTime) || 0
+    const likes = Array.isArray(post?.likes) ? post.likes : []
+    const comments = Array.isArray(post?.comments) ? post.comments : []
+
+    for (const likeNameRaw of likes) {
+      const name = String(likeNameRaw || '').trim() || '未知用户'
+      const current = likeMap.get(name)
+      if (current) {
+        current.count += 1
+        if (createTime > current.latestTime) current.latestTime = createTime
+        continue
+      }
+      likeMap.set(name, { name, count: 1, latestTime: createTime })
+    }
+
+    for (const comment of comments) {
+      const name = String(comment?.nickname || '').trim() || '未知用户'
+      const current = commentMap.get(name)
+      if (current) {
+        current.count += 1
+        if (createTime > current.latestTime) current.latestTime = createTime
+        continue
+      }
+      commentMap.set(name, { name, count: 1, latestTime: createTime })
+    }
+  }
+
+  const sorter = (a: SessionSnsRankItem, b: SessionSnsRankItem): number => {
+    if (b.count !== a.count) return b.count - a.count
+    if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+    return a.name.localeCompare(b.name, 'zh-CN')
+  }
+
+  return {
+    likes: [...likeMap.values()].sort(sorter),
+    comments: [...commentMap.values()].sort(sorter)
+  }
+}
+
+const buildSessionMutualFriendsMetric = (
+  posts: SnsPost[],
+  totalPosts: number | null
+): SessionMutualFriendsMetric => {
+  const friendMap = new Map<string, SessionMutualFriendItem>()
+
+  for (const post of posts) {
+    const createTime = Number(post?.createTime) || 0
+    const likes = Array.isArray(post?.likes) ? post.likes : []
+    const comments = Array.isArray(post?.comments) ? post.comments : []
+
+    for (const likeNameRaw of likes) {
+      const name = String(likeNameRaw || '').trim() || '未知用户'
+      const existing = friendMap.get(name)
+      if (existing) {
+        existing.incomingLikeCount += 1
+        existing.totalCount += 1
+        existing.behavior = existing.incomingCommentCount > 0 ? 'both' : 'likes'
+        if (createTime > existing.latestTime) existing.latestTime = createTime
+        continue
+      }
+      friendMap.set(name, {
+        name,
+        incomingLikeCount: 1,
+        incomingCommentCount: 0,
+        outgoingLikeCount: 0,
+        outgoingCommentCount: 0,
+        totalCount: 1,
+        latestTime: createTime,
+        direction: 'incoming',
+        behavior: 'likes'
+      })
+    }
+
+    for (const comment of comments) {
+      const name = String(comment?.nickname || '').trim() || '未知用户'
+      const existing = friendMap.get(name)
+      if (existing) {
+        existing.incomingCommentCount += 1
+        existing.totalCount += 1
+        existing.behavior = existing.incomingLikeCount > 0 ? 'both' : 'comments'
+        if (createTime > existing.latestTime) existing.latestTime = createTime
+        continue
+      }
+      friendMap.set(name, {
+        name,
+        incomingLikeCount: 0,
+        incomingCommentCount: 1,
+        outgoingLikeCount: 0,
+        outgoingCommentCount: 0,
+        totalCount: 1,
+        latestTime: createTime,
+        direction: 'incoming',
+        behavior: 'comments'
+      })
+    }
+  }
+
+  const items = [...friendMap.values()].sort((a, b) => {
+    if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount
+    if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
+
+  return {
+    count: items.length,
+    items,
+    loadedPosts: posts.length,
+    totalPosts,
+    computedAt: Date.now()
+  }
+}
+
+const getSessionMutualFriendDirectionLabel = (direction: SessionMutualFriendDirection): string => {
+  if (direction === 'incoming') return '对方赞/评TA'
+  if (direction === 'outgoing') return 'TA赞/评对方'
+  return '双方有互动'
+}
+
+const getSessionMutualFriendBehaviorLabel = (behavior: SessionMutualFriendBehavior): string => {
+  if (behavior === 'likes') return '赞'
+  if (behavior === 'comments') return '评'
+  return '赞/评'
+}
+
+const summarizeMutualFriendBehavior = (likeCount: number, commentCount: number): SessionMutualFriendBehavior => {
+  if (likeCount > 0 && commentCount > 0) return 'both'
+  if (likeCount > 0) return 'likes'
+  return 'comments'
+}
+
+const describeSessionMutualFriendRelation = (
+  item: SessionMutualFriendItem,
+  targetDisplayName: string
+): string => {
+  if (item.direction === 'incoming') {
+    if (item.behavior === 'likes') return `${item.name} 给 ${targetDisplayName} 点过赞`
+    if (item.behavior === 'comments') return `${item.name} 给 ${targetDisplayName} 评论过`
+    return `${item.name} 给 ${targetDisplayName} 点过赞、评论过`
+  }
+  if (item.direction === 'outgoing') {
+    if (item.behavior === 'likes') return `${targetDisplayName} 给 ${item.name} 点过赞`
+    if (item.behavior === 'comments') return `${targetDisplayName} 给 ${item.name} 评论过`
+    return `${targetDisplayName} 给 ${item.name} 点过赞、评论过`
+  }
+  if (item.behavior === 'likes') return `${targetDisplayName} 和 ${item.name} 双方都有点赞互动`
+  if (item.behavior === 'comments') return `${targetDisplayName} 和 ${item.name} 双方都有评论互动`
+  return `${targetDisplayName} 和 ${item.name} 双方都有点赞或评论互动`
+}
+
 interface SessionExportMetric {
   totalMessages: number
   voiceMessages: number
@@ -682,6 +792,31 @@ interface SessionExportCacheMeta {
   stale: boolean
   includeRelations: boolean
   source: 'memory' | 'disk' | 'fresh'
+}
+
+type SessionLoadStageStatus = 'pending' | 'loading' | 'done' | 'failed'
+
+interface SessionLoadStageState {
+  status: SessionLoadStageStatus
+  startedAt?: number
+  finishedAt?: number
+  error?: string
+}
+
+interface SessionLoadTraceState {
+  messageCount: SessionLoadStageState
+  mediaMetrics: SessionLoadStageState
+  snsPostCounts: SessionLoadStageState
+  mutualFriends: SessionLoadStageState
+}
+
+interface SessionLoadStageSummary {
+  total: number
+  loaded: number
+  statusLabel: string
+  startedAt?: number
+  finishedAt?: number
+  latestProgressAt?: number
 }
 
 const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T | null> => {
@@ -868,6 +1003,49 @@ const normalizeMessageCount = (value: unknown): number | undefined => {
   if (!Number.isFinite(parsed) || parsed < 0) return undefined
   return Math.floor(parsed)
 }
+
+const pickSessionMediaMetric = (
+  metricRaw: SessionExportMetric | SessionContentMetric | undefined
+): SessionContentMetric | null => {
+  if (!metricRaw) return null
+  const voiceMessages = normalizeMessageCount(metricRaw.voiceMessages)
+  const imageMessages = normalizeMessageCount(metricRaw.imageMessages)
+  const videoMessages = normalizeMessageCount(metricRaw.videoMessages)
+  const emojiMessages = normalizeMessageCount(metricRaw.emojiMessages)
+  if (
+    typeof voiceMessages !== 'number' &&
+    typeof imageMessages !== 'number' &&
+    typeof videoMessages !== 'number' &&
+    typeof emojiMessages !== 'number'
+  ) {
+    return null
+  }
+  return {
+    voiceMessages,
+    imageMessages,
+    videoMessages,
+    emojiMessages
+  }
+}
+
+const hasCompleteSessionMediaMetric = (metricRaw: SessionContentMetric | undefined): boolean => {
+  if (!metricRaw) return false
+  return (
+    typeof normalizeMessageCount(metricRaw.voiceMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.imageMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.videoMessages) === 'number' &&
+    typeof normalizeMessageCount(metricRaw.emojiMessages) === 'number'
+  )
+}
+
+const createDefaultSessionLoadStage = (): SessionLoadStageState => ({ status: 'pending' })
+
+const createDefaultSessionLoadTrace = (): SessionLoadTraceState => ({
+  messageCount: createDefaultSessionLoadStage(),
+  mediaMetrics: createDefaultSessionLoadStage(),
+  snsPostCounts: createDefaultSessionLoadStage(),
+  mutualFriends: createDefaultSessionLoadStage()
+})
 
 const WriteLayoutSelector = memo(function WriteLayoutSelector({
   writeLayout,
@@ -1208,19 +1386,42 @@ function ExportPage() {
   const [avatarCacheUpdatedAt, setAvatarCacheUpdatedAt] = useState<number | null>(null)
   const [sessionMessageCounts, setSessionMessageCounts] = useState<Record<string, number>>({})
   const [isLoadingSessionCounts, setIsLoadingSessionCounts] = useState(false)
+  const [isSessionCountStageReady, setIsSessionCountStageReady] = useState(false)
   const [sessionContentMetrics, setSessionContentMetrics] = useState<Record<string, SessionContentMetric>>({})
+  const [sessionLoadTraceMap, setSessionLoadTraceMap] = useState<Record<string, SessionLoadTraceState>>({})
+  const [sessionLoadProgressPulseMap, setSessionLoadProgressPulseMap] = useState<Record<string, { at: number; delta: number }>>({})
   const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
   const [contactsLoadSession, setContactsLoadSession] = useState<ContactsLoadSession | null>(null)
   const [contactsLoadIssue, setContactsLoadIssue] = useState<ContactsLoadIssue | null>(null)
   const [showContactsDiagnostics, setShowContactsDiagnostics] = useState(false)
   const [contactsDiagnosticTick, setContactsDiagnosticTick] = useState(Date.now())
   const [showSessionDetailPanel, setShowSessionDetailPanel] = useState(false)
+  const [showSessionLoadDetailModal, setShowSessionLoadDetailModal] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [isLoadingSessionDetail, setIsLoadingSessionDetail] = useState(false)
   const [isLoadingSessionDetailExtra, setIsLoadingSessionDetailExtra] = useState(false)
   const [isRefreshingSessionDetailStats, setIsRefreshingSessionDetailStats] = useState(false)
   const [isLoadingSessionRelationStats, setIsLoadingSessionRelationStats] = useState(false)
   const [copiedDetailField, setCopiedDetailField] = useState<string | null>(null)
+  const [snsUserPostCounts, setSnsUserPostCounts] = useState<Record<string, number>>({})
+  const [snsUserPostCountsStatus, setSnsUserPostCountsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [sessionSnsTimelineTarget, setSessionSnsTimelineTarget] = useState<SessionSnsTimelineTarget | null>(null)
+  const [sessionSnsTimelinePosts, setSessionSnsTimelinePosts] = useState<SnsPost[]>([])
+  const [sessionSnsTimelineLoading, setSessionSnsTimelineLoading] = useState(false)
+  const [sessionSnsTimelineLoadingMore, setSessionSnsTimelineLoadingMore] = useState(false)
+  const [sessionSnsTimelineHasMore, setSessionSnsTimelineHasMore] = useState(false)
+  const [sessionSnsTimelineTotalPosts, setSessionSnsTimelineTotalPosts] = useState<number | null>(null)
+  const [sessionSnsTimelineStatsLoading, setSessionSnsTimelineStatsLoading] = useState(false)
+  const [sessionSnsRankMode, setSessionSnsRankMode] = useState<SnsRankMode | null>(null)
+  const [sessionSnsLikeRankings, setSessionSnsLikeRankings] = useState<SessionSnsRankItem[]>([])
+  const [sessionSnsCommentRankings, setSessionSnsCommentRankings] = useState<SessionSnsRankItem[]>([])
+  const [sessionSnsRankLoading, setSessionSnsRankLoading] = useState(false)
+  const [sessionSnsRankError, setSessionSnsRankError] = useState<string | null>(null)
+  const [sessionSnsRankLoadedPosts, setSessionSnsRankLoadedPosts] = useState(0)
+  const [sessionSnsRankTotalPosts, setSessionSnsRankTotalPosts] = useState<number | null>(null)
+  const [sessionMutualFriendsMetrics, setSessionMutualFriendsMetrics] = useState<Record<string, SessionMutualFriendsMetric>>({})
+  const [sessionMutualFriendsDialogTarget, setSessionMutualFriendsDialogTarget] = useState<SessionSnsTimelineTarget | null>(null)
+  const [sessionMutualFriendsSearch, setSessionMutualFriendsSearch] = useState('')
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('B')
@@ -1230,10 +1431,20 @@ function ExportPage() {
   const [snsExportLivePhotos, setSnsExportLivePhotos] = useState(false)
   const [snsExportVideos, setSnsExportVideos] = useState(false)
   const [isTimeRangeDialogOpen, setIsTimeRangeDialogOpen] = useState(false)
-  const [timeRangePreset, setTimeRangePreset] = useState<DateRangePreset>('all')
-  const [timeRangeDialogDraft, setTimeRangeDialogDraft] = useState<TimeRangeDialogDraft | null>(null)
-  const [timeRangeDateInput, setTimeRangeDateInput] = useState<{ start: string; end: string }>({ start: '', end: '' })
-  const [timeRangeDateInputError, setTimeRangeDateInputError] = useState<{ start: boolean; end: boolean }>({ start: false, end: false })
+  const [isExportDefaultsModalOpen, setIsExportDefaultsModalOpen] = useState(false)
+  const [timeRangeSelection, setTimeRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
+  const [exportDefaultFormat, setExportDefaultFormat] = useState<TextExportFormat>('excel')
+  const [exportDefaultAvatars, setExportDefaultAvatars] = useState(true)
+  const [exportDefaultDateRangeSelection, setExportDefaultDateRangeSelection] = useState<ExportDateRangeSelection>(() => createDefaultExportDateRangeSelection())
+  const [exportDefaultMedia, setExportDefaultMedia] = useState<configService.ExportDefaultMediaConfig>({
+    images: true,
+    videos: true,
+    voices: true,
+    emojis: true
+  })
+  const [exportDefaultVoiceAsText, setExportDefaultVoiceAsText] = useState(false)
+  const [exportDefaultExcelCompactColumns, setExportDefaultExcelCompactColumns] = useState(true)
+  const [exportDefaultConcurrency, setExportDefaultConcurrency] = useState(2)
 
   const [options, setOptions] = useState<ExportOptions>({
     format: 'json',
@@ -1243,11 +1454,11 @@ function ExportPage() {
     },
     useAllTime: false,
     exportAvatars: true,
-    exportMedia: false,
+    exportMedia: true,
     exportImages: true,
     exportVoices: true,
     exportVideos: true,
-    exportEmojis: true,
+        exportEmojis: true,
     exportVoiceAsText: false,
     excelCompactColumns: true,
     txtColumns: defaultTxtColumns,
@@ -1262,6 +1473,7 @@ function ExportPage() {
     sessionNames: [],
     title: ''
   })
+  const [showSessionFormatSelect, setShowSessionFormatSelect] = useState(false)
 
   const [tasks, setTasks] = useState<ExportTask[]>([])
   const [lastExportBySession, setLastExportBySession] = useState<Record<string, number>>({})
@@ -1296,8 +1508,10 @@ function ExportPage() {
   const contactsAvatarCacheRef = useRef<Record<string, configService.ContactsAvatarCacheEntry>>({})
   const contactsVirtuosoRef = useRef<VirtuosoHandle | null>(null)
   const sessionTableSectionRef = useRef<HTMLDivElement | null>(null)
+  const sessionFormatDropdownRef = useRef<HTMLDivElement | null>(null)
   const detailRequestSeqRef = useRef(0)
   const sessionsRef = useRef<SessionRow[]>([])
+  const sessionContentMetricsRef = useRef<Record<string, SessionContentMetric>>({})
   const contactsListSizeRef = useRef(0)
   const contactsUpdatedAtRef = useRef<number | null>(null)
   const sessionsHydratedAtRef = useRef(0)
@@ -1306,7 +1520,45 @@ function ExportPage() {
   const activeTaskCountRef = useRef(0)
   const hasBaseConfigReadyRef = useRef(false)
   const sessionCountRequestIdRef = useRef(0)
+  const isLoadingSessionCountsRef = useRef(false)
   const activeTabRef = useRef<ConversationTab>('private')
+  const detailStatsPriorityRef = useRef(false)
+  const sessionSnsTimelinePostsRef = useRef<SnsPost[]>([])
+  const sessionSnsTimelineLoadingRef = useRef(false)
+  const sessionSnsTimelineRequestTokenRef = useRef(0)
+  const sessionSnsRankRequestTokenRef = useRef(0)
+  const sessionSnsRankLoadingRef = useRef(false)
+  const sessionSnsRankCacheRef = useRef<Record<string, SessionSnsRankCacheEntry>>({})
+  const snsUserPostCountsHydrationTokenRef = useRef(0)
+  const snsUserPostCountsBatchTimerRef = useRef<number | null>(null)
+  const sessionPreciseRefreshAtRef = useRef<Record<string, number>>({})
+  const sessionLoadProgressSnapshotRef = useRef<Record<string, { loaded: number; total: number }>>({})
+  const sessionMediaMetricQueueRef = useRef<string[]>([])
+  const sessionMediaMetricQueuedSetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricLoadingSetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricReadySetRef = useRef<Set<string>>(new Set())
+  const sessionMediaMetricRunIdRef = useRef(0)
+  const sessionMediaMetricWorkerRunningRef = useRef(false)
+  const sessionMediaMetricBackgroundFeedTimerRef = useRef<number | null>(null)
+  const sessionMediaMetricPersistTimerRef = useRef<number | null>(null)
+  const sessionMediaMetricPendingPersistRef = useRef<Record<string, configService.ExportSessionContentMetricCacheEntry>>({})
+  const sessionMediaMetricVisibleRangeRef = useRef<{ startIndex: number; endIndex: number }>({
+    startIndex: 0,
+    endIndex: -1
+  })
+  const sessionMutualFriendsMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
+  const sessionMutualFriendsDirectMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
+  const sessionMutualFriendsQueueRef = useRef<string[]>([])
+  const sessionMutualFriendsQueuedSetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsLoadingSetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsReadySetRef = useRef<Set<string>>(new Set())
+  const sessionMutualFriendsRunIdRef = useRef(0)
+  const sessionMutualFriendsWorkerRunningRef = useRef(false)
+  const sessionMutualFriendsBackgroundFeedTimerRef = useRef<number | null>(null)
+  const sessionMutualFriendsVisibleRangeRef = useRef<{ startIndex: number; endIndex: number }>({
+    startIndex: 0,
+    endIndex: -1
+  })
 
   const ensureExportCacheScope = useCallback(async (): Promise<string> => {
     if (exportCacheScopeReadyRef.current) {
@@ -1355,6 +1607,108 @@ function ExportPage() {
   useEffect(() => {
     contactsLoadTimeoutMsRef.current = contactsLoadTimeoutMs
   }, [contactsLoadTimeoutMs])
+
+  useEffect(() => {
+    isLoadingSessionCountsRef.current = isLoadingSessionCounts
+  }, [isLoadingSessionCounts])
+
+  useEffect(() => {
+    sessionContentMetricsRef.current = sessionContentMetrics
+  }, [sessionContentMetrics])
+
+  useEffect(() => {
+    sessionMutualFriendsMetricsRef.current = sessionMutualFriendsMetrics
+  }, [sessionMutualFriendsMetrics])
+
+  const patchSessionLoadTraceStage = useCallback((
+    sessionIds: string[],
+    stageKey: keyof SessionLoadTraceState,
+    status: SessionLoadStageStatus,
+    options?: { force?: boolean; error?: string }
+  ) => {
+    if (sessionIds.length === 0) return
+    const now = Date.now()
+    setSessionLoadTraceMap(prev => {
+      let changed = false
+      const next = { ...prev }
+      for (const sessionIdRaw of sessionIds) {
+        const sessionId = String(sessionIdRaw || '').trim()
+        if (!sessionId) continue
+        const prevTrace = next[sessionId] || createDefaultSessionLoadTrace()
+        const prevStage = prevTrace[stageKey] || createDefaultSessionLoadStage()
+        if (!options?.force && prevStage.status === 'done' && status !== 'done') {
+          continue
+        }
+        let stageChanged = false
+        const nextStage: SessionLoadStageState = { ...prevStage }
+        if (nextStage.status !== status) {
+          nextStage.status = status
+          stageChanged = true
+        }
+        if (status === 'loading') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (nextStage.finishedAt) {
+            nextStage.finishedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.error) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        } else if (status === 'done') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (!nextStage.finishedAt) {
+            nextStage.finishedAt = now
+            stageChanged = true
+          }
+          if (nextStage.error) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        } else if (status === 'failed') {
+          if (!nextStage.startedAt) {
+            nextStage.startedAt = now
+            stageChanged = true
+          }
+          if (!nextStage.finishedAt) {
+            nextStage.finishedAt = now
+            stageChanged = true
+          }
+          const nextError = options?.error || '加载失败'
+          if (nextStage.error !== nextError) {
+            nextStage.error = nextError
+            stageChanged = true
+          }
+        } else if (status === 'pending') {
+          if (nextStage.startedAt !== undefined) {
+            nextStage.startedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.finishedAt !== undefined) {
+            nextStage.finishedAt = undefined
+            stageChanged = true
+          }
+          if (nextStage.error !== undefined) {
+            nextStage.error = undefined
+            stageChanged = true
+          }
+        }
+        if (!stageChanged) continue
+        next[sessionId] = {
+          ...prevTrace,
+          [stageKey]: nextStage
+        }
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [])
 
   const loadContactsList = useCallback(async (options?: { scopeKey?: string }) => {
     const scopeKey = options?.scopeKey || await ensureExportCacheScope()
@@ -1577,6 +1931,10 @@ function ExportPage() {
     hasSeededSnsStatsRef.current = hasSeededSnsStats
   }, [hasSeededSnsStats])
 
+  useEffect(() => {
+    sessionSnsTimelinePostsRef.current = sessionSnsTimelinePosts
+  }, [sessionSnsTimelinePosts])
+
   const preselectSessionIds = useMemo(() => {
     const state = location.state as { preselectSessionIds?: unknown; preselectSessionId?: unknown } | null
     const rawList = Array.isArray(state?.preselectSessionIds)
@@ -1607,8 +1965,10 @@ function ExportPage() {
     setIsBaseConfigLoading(true)
     let isReady = true
     try {
-      const [savedPath, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, exportCacheScope] = await Promise.all([
+      const [savedPath, savedFormat, savedAvatars, savedMedia, savedVoiceAsText, savedExcelCompactColumns, savedTxtColumns, savedConcurrency, savedSessionMap, savedContentMap, savedSessionRecordMap, savedSnsPostCount, savedWriteLayout, savedSessionNameWithTypePrefix, savedDefaultDateRange, exportCacheScope] = await Promise.all([
         configService.getExportPath(),
+        configService.getExportDefaultFormat(),
+        configService.getExportDefaultAvatars(),
         configService.getExportDefaultMedia(),
         configService.getExportDefaultVoiceAsText(),
         configService.getExportDefaultExcelCompactColumns(),
@@ -1620,6 +1980,7 @@ function ExportPage() {
         configService.getExportLastSnsPostCount(),
         configService.getExportWriteLayout(),
         configService.getExportSessionNamePrefixEnabled(),
+        configService.getExportDefaultDateRange(),
         ensureExportCacheScope()
       ])
 
@@ -1638,7 +1999,20 @@ function ExportPage() {
       setLastExportByContent(savedContentMap)
       setExportRecordsBySession(savedSessionRecordMap)
       setLastSnsExportPostCount(savedSnsPostCount)
-      await configService.setExportDefaultFormat('json')
+      setExportDefaultFormat((savedFormat as TextExportFormat) || 'excel')
+      setExportDefaultAvatars(savedAvatars ?? true)
+      setExportDefaultMedia(savedMedia ?? {
+        images: true,
+        videos: true,
+        voices: true,
+        emojis: true
+      })
+      setExportDefaultVoiceAsText(savedVoiceAsText ?? false)
+      setExportDefaultExcelCompactColumns(savedExcelCompactColumns ?? true)
+      setExportDefaultConcurrency(savedConcurrency ?? 2)
+      const resolvedDefaultDateRange = resolveExportDateRangeConfig(savedDefaultDateRange)
+      setExportDefaultDateRangeSelection(resolvedDefaultDateRange)
+      setTimeRangeSelection(resolvedDefaultDateRange)
 
       if (cachedSnsStats && Date.now() - cachedSnsStats.updatedAt <= EXPORT_SNS_STATS_CACHE_STALE_MS) {
         setSnsStats({
@@ -1653,8 +2027,18 @@ function ExportPage() {
       const txtColumns = savedTxtColumns && savedTxtColumns.length > 0 ? savedTxtColumns : defaultTxtColumns
       setOptions(prev => ({
         ...prev,
-        format: 'json',
-        exportMedia: savedMedia ?? prev.exportMedia,
+        format: ((savedFormat as TextExportFormat) || 'excel'),
+        exportAvatars: savedAvatars ?? true,
+        exportMedia: Boolean(
+          (savedMedia?.images ?? prev.exportImages) ||
+          (savedMedia?.voices ?? prev.exportVoices) ||
+          (savedMedia?.videos ?? prev.exportVideos) ||
+          (savedMedia?.emojis ?? prev.exportEmojis)
+        ),
+        exportImages: savedMedia?.images ?? prev.exportImages,
+        exportVoices: savedMedia?.voices ?? prev.exportVoices,
+        exportVideos: savedMedia?.videos ?? prev.exportVideos,
+        exportEmojis: savedMedia?.emojis ?? prev.exportEmojis,
         exportVoiceAsText: savedVoiceAsText ?? prev.exportVoiceAsText,
         excelCompactColumns: savedExcelCompactColumns ?? prev.excelCompactColumns,
         txtColumns,
@@ -1721,6 +2105,445 @@ function ExportPage() {
       }
     }
   }, [])
+
+  const loadSnsUserPostCounts = useCallback(async (options?: { force?: boolean }) => {
+    if (snsUserPostCountsStatus === 'loading') return
+    if (!options?.force && snsUserPostCountsStatus === 'ready') return
+
+    const targetSessionIds = sessionsRef.current
+      .filter((session) => session.hasSession && isSingleContactSession(session.username))
+      .map((session) => session.username)
+
+    snsUserPostCountsHydrationTokenRef.current += 1
+    const runToken = snsUserPostCountsHydrationTokenRef.current
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+
+    if (targetSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+
+    const scopeKey = exportCacheScopeReadyRef.current
+      ? exportCacheScopeRef.current
+      : await ensureExportCacheScope()
+    const targetSet = new Set(targetSessionIds)
+    let cachedCounts: Record<string, number> = {}
+    try {
+      const cached = await configService.getExportSnsUserPostCountsCache(scopeKey)
+      cachedCounts = cached?.counts || {}
+    } catch (cacheError) {
+      console.error('读取导出页朋友圈条数缓存失败:', cacheError)
+    }
+
+    const cachedTargetCounts = Object.entries(cachedCounts).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+      if (!targetSet.has(sessionId)) return acc
+      const nextCount = Number(countRaw)
+      acc[sessionId] = Number.isFinite(nextCount) ? Math.max(0, Math.floor(nextCount)) : 0
+      return acc
+    }, {})
+    const cachedReadySessionIds = Object.keys(cachedTargetCounts)
+    if (cachedReadySessionIds.length > 0) {
+      setSnsUserPostCounts(prev => ({ ...prev, ...cachedTargetCounts }))
+      patchSessionLoadTraceStage(cachedReadySessionIds, 'snsPostCounts', 'done')
+    }
+
+    const pendingSessionIds = options?.force
+      ? targetSessionIds
+      : targetSessionIds.filter((sessionId) => !(sessionId in cachedTargetCounts))
+    if (pendingSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+
+    patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'pending', { force: true })
+    patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'loading')
+    setSnsUserPostCountsStatus('loading')
+
+    let normalizedCounts: Record<string, number> = {}
+    try {
+      const result = await window.electronAPI.sns.getUserPostCounts()
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      if (!result.success || !result.counts) {
+        patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'failed', {
+          error: result.error || '朋友圈条数统计失败'
+        })
+        setSnsUserPostCountsStatus('error')
+        return
+      }
+
+      for (const [rawUsername, rawCount] of Object.entries(result.counts)) {
+        const username = String(rawUsername || '').trim()
+        if (!username) continue
+        const value = Number(rawCount)
+        normalizedCounts[username] = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+      }
+
+      void (async () => {
+        try {
+          await configService.setExportSnsUserPostCountsCache(scopeKey, normalizedCounts)
+        } catch (cacheError) {
+          console.error('写入导出页朋友圈条数缓存失败:', cacheError)
+        }
+      })()
+    } catch (error) {
+      console.error('加载朋友圈用户条数失败:', error)
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+      patchSessionLoadTraceStage(pendingSessionIds, 'snsPostCounts', 'failed', {
+        error: String(error)
+      })
+      setSnsUserPostCountsStatus('error')
+      return
+    }
+
+    let cursor = 0
+    const applyBatch = () => {
+      if (runToken !== snsUserPostCountsHydrationTokenRef.current) return
+
+      const batchSessionIds = pendingSessionIds.slice(cursor, cursor + SNS_USER_POST_COUNT_BATCH_SIZE)
+      if (batchSessionIds.length === 0) {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+        return
+      }
+
+      const batchCounts: Record<string, number> = {}
+      for (const sessionId of batchSessionIds) {
+        const nextCount = normalizedCounts[sessionId]
+        batchCounts[sessionId] = Number.isFinite(nextCount) ? Math.max(0, Math.floor(nextCount)) : 0
+      }
+
+      setSnsUserPostCounts(prev => ({ ...prev, ...batchCounts }))
+      patchSessionLoadTraceStage(batchSessionIds, 'snsPostCounts', 'done')
+
+      cursor += batchSessionIds.length
+      if (cursor < targetSessionIds.length) {
+        snsUserPostCountsBatchTimerRef.current = window.setTimeout(applyBatch, SNS_USER_POST_COUNT_BATCH_INTERVAL_MS)
+      } else {
+        setSnsUserPostCountsStatus('ready')
+        snsUserPostCountsBatchTimerRef.current = null
+      }
+    }
+
+    applyBatch()
+  }, [ensureExportCacheScope, patchSessionLoadTraceStage, snsUserPostCountsStatus])
+
+  const loadSessionSnsTimelinePosts = useCallback(async (target: SessionSnsTimelineTarget, options?: { reset?: boolean }) => {
+    const reset = Boolean(options?.reset)
+    if (sessionSnsTimelineLoadingRef.current) return
+
+    sessionSnsTimelineLoadingRef.current = true
+    if (reset) {
+      setSessionSnsTimelineLoading(true)
+      setSessionSnsTimelineLoadingMore(false)
+      setSessionSnsTimelineHasMore(false)
+    } else {
+      setSessionSnsTimelineLoadingMore(true)
+    }
+
+    const requestToken = ++sessionSnsTimelineRequestTokenRef.current
+
+    try {
+      const limit = 20
+      let endTime: number | undefined
+      if (!reset && sessionSnsTimelinePostsRef.current.length > 0) {
+        endTime = sessionSnsTimelinePostsRef.current[sessionSnsTimelinePostsRef.current.length - 1].createTime - 1
+      }
+
+      const result = await window.electronAPI.sns.getTimeline(limit, 0, [target.username], '', undefined, endTime)
+      if (requestToken !== sessionSnsTimelineRequestTokenRef.current) return
+
+      if (!result.success || !Array.isArray(result.timeline)) {
+        if (reset) {
+          setSessionSnsTimelinePosts([])
+          setSessionSnsTimelineHasMore(false)
+        }
+        return
+      }
+
+      const timeline = [...(result.timeline as SnsPost[])].sort((a, b) => b.createTime - a.createTime)
+      if (reset) {
+        setSessionSnsTimelinePosts(timeline)
+        setSessionSnsTimelineHasMore(timeline.length >= limit)
+        return
+      }
+
+      const existingIds = new Set(sessionSnsTimelinePostsRef.current.map((post) => post.id))
+      const uniqueOlder = timeline.filter((post) => !existingIds.has(post.id))
+      if (uniqueOlder.length > 0) {
+        const merged = [...sessionSnsTimelinePostsRef.current, ...uniqueOlder].sort((a, b) => b.createTime - a.createTime)
+        setSessionSnsTimelinePosts(merged)
+      }
+      if (timeline.length < limit) {
+        setSessionSnsTimelineHasMore(false)
+      }
+    } catch (error) {
+      console.error('加载联系人朋友圈失败:', error)
+      if (requestToken === sessionSnsTimelineRequestTokenRef.current && reset) {
+        setSessionSnsTimelinePosts([])
+        setSessionSnsTimelineHasMore(false)
+      }
+    } finally {
+      if (requestToken === sessionSnsTimelineRequestTokenRef.current) {
+        sessionSnsTimelineLoadingRef.current = false
+        setSessionSnsTimelineLoading(false)
+        setSessionSnsTimelineLoadingMore(false)
+      }
+    }
+  }, [])
+
+  const closeSessionSnsTimeline = useCallback(() => {
+    sessionSnsTimelineRequestTokenRef.current += 1
+    sessionSnsTimelineLoadingRef.current = false
+    sessionSnsRankRequestTokenRef.current += 1
+    sessionSnsRankLoadingRef.current = false
+    setSessionSnsRankMode(null)
+    setSessionSnsLikeRankings([])
+    setSessionSnsCommentRankings([])
+    setSessionSnsRankLoading(false)
+    setSessionSnsRankError(null)
+    setSessionSnsRankLoadedPosts(0)
+    setSessionSnsRankTotalPosts(null)
+    setSessionSnsTimelineTarget(null)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineLoading(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
+  }, [])
+
+  const sessionSnsTimelineInitialTotalPosts = useMemo(() => {
+    const username = String(sessionSnsTimelineTarget?.username || '').trim()
+    if (!username) return null
+    if (!Object.prototype.hasOwnProperty.call(snsUserPostCounts, username)) return null
+    const count = Number(snsUserPostCounts[username] || 0)
+    return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+  }, [sessionSnsTimelineTarget, snsUserPostCounts])
+
+  const sessionSnsTimelineInitialTotalPostsLoading = useMemo(() => {
+    const username = String(sessionSnsTimelineTarget?.username || '').trim()
+    if (!username) return false
+    if (Object.prototype.hasOwnProperty.call(snsUserPostCounts, username)) return false
+    return snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle'
+  }, [sessionSnsTimelineTarget, snsUserPostCounts, snsUserPostCountsStatus])
+
+  const openSessionSnsTimelineByTarget = useCallback((target: SessionSnsTimelineTarget) => {
+    sessionSnsRankRequestTokenRef.current += 1
+    sessionSnsRankLoadingRef.current = false
+    setSessionSnsRankMode(null)
+    setSessionSnsLikeRankings([])
+    setSessionSnsCommentRankings([])
+    setSessionSnsRankLoading(false)
+    setSessionSnsRankError(null)
+    setSessionSnsRankLoadedPosts(0)
+    setSessionSnsTimelineTarget(target)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineLoading(false)
+    const hasKnownCount = Object.prototype.hasOwnProperty.call(snsUserPostCounts, target.username)
+    if (hasKnownCount) {
+      const count = Number(snsUserPostCounts[target.username] || 0)
+      const normalizedCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+      setSessionSnsTimelineTotalPosts(normalizedCount)
+      setSessionSnsTimelineStatsLoading(false)
+      setSessionSnsRankTotalPosts(normalizedCount)
+    } else {
+      setSessionSnsTimelineTotalPosts(null)
+      setSessionSnsTimelineStatsLoading(snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle')
+      setSessionSnsRankTotalPosts(null)
+    }
+
+    void loadSnsUserPostCounts()
+  }, [
+    loadSnsUserPostCounts,
+    snsUserPostCounts,
+    snsUserPostCountsStatus
+  ])
+
+  const openSessionSnsTimeline = useCallback(() => {
+    const normalizedSessionId = String(sessionDetail?.wxid || '').trim()
+    if (!isSingleContactSession(normalizedSessionId) || !sessionDetail) return
+
+    const target: SessionSnsTimelineTarget = {
+      username: normalizedSessionId,
+      displayName: sessionDetail.displayName || sessionDetail.remark || sessionDetail.nickName || normalizedSessionId,
+      avatarUrl: sessionDetail.avatarUrl
+    }
+
+    openSessionSnsTimelineByTarget(target)
+  }, [openSessionSnsTimelineByTarget, sessionDetail])
+
+  const openContactSnsTimeline = useCallback((contact: ContactInfo) => {
+    const normalizedSessionId = String(contact?.username || '').trim()
+    if (!isSingleContactSession(normalizedSessionId)) return
+    openSessionSnsTimelineByTarget({
+      username: normalizedSessionId,
+      displayName: contact.displayName || contact.remark || contact.nickname || normalizedSessionId,
+      avatarUrl: contact.avatarUrl
+    })
+  }, [openSessionSnsTimelineByTarget])
+
+  const openSessionMutualFriendsDialog = useCallback((contact: ContactInfo) => {
+    const normalizedSessionId = String(contact?.username || '').trim()
+    if (!normalizedSessionId || !isSingleContactSession(normalizedSessionId)) return
+    const metric = sessionMutualFriendsMetricsRef.current[normalizedSessionId]
+    if (!metric) return
+    setSessionMutualFriendsSearch('')
+    setSessionMutualFriendsDialogTarget({
+      username: normalizedSessionId,
+      displayName: contact.displayName || contact.remark || contact.nickname || normalizedSessionId,
+      avatarUrl: contact.avatarUrl
+    })
+  }, [])
+
+  const closeSessionMutualFriendsDialog = useCallback(() => {
+    setSessionMutualFriendsDialogTarget(null)
+    setSessionMutualFriendsSearch('')
+  }, [])
+
+  const loadMoreSessionSnsTimeline = useCallback(() => {
+    if (!sessionSnsTimelineTarget || sessionSnsTimelineLoading || sessionSnsTimelineLoadingMore || !sessionSnsTimelineHasMore) return
+    void loadSessionSnsTimelinePosts(sessionSnsTimelineTarget, { reset: false })
+  }, [
+    loadSessionSnsTimelinePosts,
+    sessionSnsTimelineHasMore,
+    sessionSnsTimelineLoading,
+    sessionSnsTimelineLoadingMore,
+    sessionSnsTimelineTarget
+  ])
+
+  const loadSessionSnsRankings = useCallback(async (target: SessionSnsTimelineTarget) => {
+    const normalizedUsername = String(target?.username || '').trim()
+    if (!normalizedUsername || sessionSnsRankLoadingRef.current) return
+
+    const knownTotal = snsUserPostCountsStatus === 'ready'
+      ? Number(snsUserPostCounts[normalizedUsername] || 0)
+      : null
+    const normalizedKnownTotal = knownTotal !== null && Number.isFinite(knownTotal)
+      ? Math.max(0, Math.floor(knownTotal))
+      : null
+    const cached = sessionSnsRankCacheRef.current[normalizedUsername]
+
+    if (cached && (normalizedKnownTotal === null || cached.totalPosts === normalizedKnownTotal)) {
+      setSessionSnsLikeRankings(cached.likes)
+      setSessionSnsCommentRankings(cached.comments)
+      setSessionSnsRankLoadedPosts(cached.totalPosts)
+      setSessionSnsRankTotalPosts(cached.totalPosts)
+      setSessionSnsRankError(null)
+      setSessionSnsRankLoading(false)
+      return
+    }
+
+    sessionSnsRankLoadingRef.current = true
+    const requestToken = ++sessionSnsRankRequestTokenRef.current
+    setSessionSnsRankLoading(true)
+    setSessionSnsRankError(null)
+    setSessionSnsRankLoadedPosts(0)
+    setSessionSnsRankTotalPosts(normalizedKnownTotal)
+
+    try {
+      const allPosts: SnsPost[] = []
+      let endTime: number | undefined
+      let hasMore = true
+
+      while (hasMore) {
+        const result = await window.electronAPI.sns.getTimeline(
+          SNS_RANK_PAGE_SIZE,
+          0,
+          [normalizedUsername],
+          '',
+          undefined,
+          endTime
+        )
+        if (requestToken !== sessionSnsRankRequestTokenRef.current) return
+
+        if (!result.success) {
+          throw new Error(result.error || '加载朋友圈排行失败')
+        }
+
+        const pagePosts = Array.isArray(result.timeline)
+          ? [...(result.timeline as SnsPost[])].sort((a, b) => b.createTime - a.createTime)
+          : []
+        if (pagePosts.length === 0) {
+          hasMore = false
+          break
+        }
+
+        allPosts.push(...pagePosts)
+        setSessionSnsRankLoadedPosts(allPosts.length)
+        if (normalizedKnownTotal === null) {
+          setSessionSnsRankTotalPosts(allPosts.length)
+        }
+
+        endTime = pagePosts[pagePosts.length - 1].createTime - 1
+        hasMore = pagePosts.length >= SNS_RANK_PAGE_SIZE
+      }
+
+      if (requestToken !== sessionSnsRankRequestTokenRef.current) return
+
+      const rankings = buildSessionSnsRankings(allPosts)
+      const totalPosts = allPosts.length
+      sessionSnsRankCacheRef.current[normalizedUsername] = {
+        likes: rankings.likes,
+        comments: rankings.comments,
+        totalPosts,
+        computedAt: Date.now()
+      }
+      setSessionSnsLikeRankings(rankings.likes)
+      setSessionSnsCommentRankings(rankings.comments)
+      setSessionSnsRankLoadedPosts(totalPosts)
+      setSessionSnsRankTotalPosts(totalPosts)
+      setSessionSnsRankError(null)
+    } catch (error) {
+      if (requestToken !== sessionSnsRankRequestTokenRef.current) return
+      const message = error instanceof Error ? error.message : String(error)
+      setSessionSnsLikeRankings([])
+      setSessionSnsCommentRankings([])
+      setSessionSnsRankError(message || '加载朋友圈排行失败')
+    } finally {
+      if (requestToken === sessionSnsRankRequestTokenRef.current) {
+        sessionSnsRankLoadingRef.current = false
+        setSessionSnsRankLoading(false)
+      }
+    }
+  }, [snsUserPostCounts, snsUserPostCountsStatus])
+
+  const renderSessionSnsTimelineStats = useCallback((): string => {
+    const loadedCount = sessionSnsTimelinePosts.length
+    const loadPart = sessionSnsTimelineStatsLoading
+      ? `已加载 ${loadedCount} / 总数统计中...`
+      : sessionSnsTimelineTotalPosts === null
+        ? `已加载 ${loadedCount} 条`
+        : `已加载 ${loadedCount} / 共 ${sessionSnsTimelineTotalPosts} 条`
+
+    if (sessionSnsTimelineLoading && loadedCount === 0) return `${loadPart} ｜ 加载中...`
+    if (loadedCount === 0) return loadPart
+
+    const latest = sessionSnsTimelinePosts[0]?.createTime
+    const earliest = sessionSnsTimelinePosts[sessionSnsTimelinePosts.length - 1]?.createTime
+    const rangeText = `${formatYmdDateFromSeconds(earliest)} ~ ${formatYmdDateFromSeconds(latest)}`
+    return `${loadPart} ｜ ${rangeText}`
+  }, [
+    sessionSnsTimelineLoading,
+    sessionSnsTimelinePosts,
+    sessionSnsTimelineStatsLoading,
+    sessionSnsTimelineTotalPosts
+  ])
+
+  const toggleSessionSnsRankMode = useCallback((mode: SnsRankMode) => {
+    setSessionSnsRankMode((prev) => (prev === mode ? null : mode))
+  }, [])
+
+  const sessionSnsActiveRankings = useMemo(() => {
+    if (sessionSnsRankMode === 'likes') return sessionSnsLikeRankings
+    if (sessionSnsRankMode === 'comments') return sessionSnsCommentRankings
+    return []
+  }, [sessionSnsCommentRankings, sessionSnsLikeRankings, sessionSnsRankMode])
 
   const mergeSessionContentMetrics = useCallback((input: Record<string, SessionExportMetric | SessionContentMetric | undefined>) => {
     const entries = Object.entries(input)
@@ -1818,6 +2641,469 @@ function ExportPage() {
     }
   }, [])
 
+  const resetSessionMediaMetricLoader = useCallback(() => {
+    sessionMediaMetricRunIdRef.current += 1
+    sessionMediaMetricQueueRef.current = []
+    sessionMediaMetricQueuedSetRef.current.clear()
+    sessionMediaMetricLoadingSetRef.current.clear()
+    sessionMediaMetricReadySetRef.current.clear()
+    sessionMediaMetricWorkerRunningRef.current = false
+    sessionMediaMetricPendingPersistRef.current = {}
+    sessionMediaMetricVisibleRangeRef.current = { startIndex: 0, endIndex: -1 }
+    if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+      sessionMediaMetricBackgroundFeedTimerRef.current = null
+    }
+    if (sessionMediaMetricPersistTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricPersistTimerRef.current)
+      sessionMediaMetricPersistTimerRef.current = null
+    }
+  }, [])
+
+  const flushSessionMediaMetricCache = useCallback(async () => {
+    const pendingMetrics = sessionMediaMetricPendingPersistRef.current
+    sessionMediaMetricPendingPersistRef.current = {}
+    if (Object.keys(pendingMetrics).length === 0) return
+
+    try {
+      const scopeKey = await ensureExportCacheScope()
+      const existing = await configService.getExportSessionContentMetricCache(scopeKey)
+      const nextMetrics = {
+        ...(existing?.metrics || {}),
+        ...pendingMetrics
+      }
+      await configService.setExportSessionContentMetricCache(scopeKey, nextMetrics)
+    } catch (error) {
+      console.error('写入导出页会话内容统计缓存失败:', error)
+    }
+  }, [ensureExportCacheScope])
+
+  const scheduleFlushSessionMediaMetricCache = useCallback(() => {
+    if (sessionMediaMetricPersistTimerRef.current) return
+    sessionMediaMetricPersistTimerRef.current = window.setTimeout(() => {
+      sessionMediaMetricPersistTimerRef.current = null
+      void flushSessionMediaMetricCache()
+    }, SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS)
+  }, [flushSessionMediaMetricCache])
+
+  const resetSessionMutualFriendsLoader = useCallback(() => {
+    sessionMutualFriendsRunIdRef.current += 1
+    sessionMutualFriendsDirectMetricsRef.current = {}
+    sessionMutualFriendsQueueRef.current = []
+    sessionMutualFriendsQueuedSetRef.current.clear()
+    sessionMutualFriendsLoadingSetRef.current.clear()
+    sessionMutualFriendsReadySetRef.current.clear()
+    sessionMutualFriendsWorkerRunningRef.current = false
+    sessionMutualFriendsVisibleRangeRef.current = { startIndex: 0, endIndex: -1 }
+    if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+      sessionMutualFriendsBackgroundFeedTimerRef.current = null
+    }
+  }, [])
+
+  const isSessionMutualFriendsReady = useCallback((sessionId: string): boolean => {
+    if (!sessionId) return true
+    if (sessionMutualFriendsReadySetRef.current.has(sessionId)) return true
+    const existing = sessionMutualFriendsMetricsRef.current[sessionId]
+    if (existing && typeof existing.count === 'number' && Array.isArray(existing.items)) {
+      sessionMutualFriendsReadySetRef.current.add(sessionId)
+      return true
+    }
+    return false
+  }, [])
+
+  const enqueueSessionMutualFriendsRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    const front = options?.front === true
+    const incoming: string[] = []
+    for (const sessionIdRaw of sessionIds) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      if (sessionMutualFriendsQueuedSetRef.current.has(sessionId)) continue
+      if (sessionMutualFriendsLoadingSetRef.current.has(sessionId)) continue
+      if (isSessionMutualFriendsReady(sessionId)) continue
+      sessionMutualFriendsQueuedSetRef.current.add(sessionId)
+      incoming.push(sessionId)
+    }
+    if (incoming.length === 0) return
+    patchSessionLoadTraceStage(incoming, 'mutualFriends', 'pending')
+    if (front) {
+      sessionMutualFriendsQueueRef.current = [...incoming, ...sessionMutualFriendsQueueRef.current]
+    } else {
+      sessionMutualFriendsQueueRef.current.push(...incoming)
+    }
+  }, [isSessionMutualFriendsReady, patchSessionLoadTraceStage])
+
+  const hasPendingMetricLoads = useCallback((): boolean => (
+    isLoadingSessionCountsRef.current ||
+    sessionMediaMetricQueuedSetRef.current.size > 0 ||
+    sessionMediaMetricLoadingSetRef.current.size > 0 ||
+    sessionMediaMetricWorkerRunningRef.current ||
+    snsUserPostCountsStatus === 'loading' ||
+    snsUserPostCountsStatus === 'idle'
+  ), [snsUserPostCountsStatus])
+
+  const getSessionMutualFriendProfile = useCallback((sessionId: string): {
+    displayName: string
+    candidateNames: Set<string>
+  } => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const contact = contactsList.find(item => item.username === normalizedSessionId)
+    const session = sessionsRef.current.find(item => item.username === normalizedSessionId)
+    const displayName = contact?.displayName || contact?.remark || contact?.nickname || session?.displayName || normalizedSessionId
+    return {
+      displayName,
+      candidateNames: toComparableNameSet([
+        displayName,
+        contact?.displayName,
+        contact?.remark,
+        contact?.nickname,
+        contact?.alias
+      ])
+    }
+  }, [contactsList])
+
+  const rebuildSessionMutualFriendsMetric = useCallback((targetSessionId: string): SessionMutualFriendsMetric | null => {
+    const normalizedTargetSessionId = String(targetSessionId || '').trim()
+    if (!normalizedTargetSessionId) return null
+
+    const directMetrics = sessionMutualFriendsDirectMetricsRef.current
+    const directMetric = directMetrics[normalizedTargetSessionId]
+    if (!directMetric) return null
+
+    const { candidateNames } = getSessionMutualFriendProfile(normalizedTargetSessionId)
+    const mergedMap = new Map<string, SessionMutualFriendItem>()
+    for (const item of directMetric.items) {
+      mergedMap.set(item.name, { ...item })
+    }
+
+    for (const [sourceSessionId, sourceMetric] of Object.entries(directMetrics)) {
+      if (!sourceMetric || sourceSessionId === normalizedTargetSessionId) continue
+      const sourceProfile = getSessionMutualFriendProfile(sourceSessionId)
+      if (!sourceProfile.displayName) continue
+      if (mergedMap.has(sourceProfile.displayName)) continue
+
+      const reverseMatches = sourceMetric.items.filter(item => candidateNames.has(item.name))
+      if (reverseMatches.length === 0) continue
+
+      const reverseCount = reverseMatches.reduce((sum, item) => sum + item.totalCount, 0)
+      const reverseLikeCount = reverseMatches.reduce((sum, item) => sum + item.incomingLikeCount, 0)
+      const reverseCommentCount = reverseMatches.reduce((sum, item) => sum + item.incomingCommentCount, 0)
+      const reverseLatestTime = reverseMatches.reduce((latest, item) => Math.max(latest, item.latestTime), 0)
+      const existing = mergedMap.get(sourceProfile.displayName)
+      if (existing) {
+        existing.outgoingLikeCount += reverseLikeCount
+        existing.outgoingCommentCount += reverseCommentCount
+        existing.totalCount += reverseCount
+        existing.latestTime = Math.max(existing.latestTime, reverseLatestTime)
+        existing.direction = (existing.incomingLikeCount + existing.incomingCommentCount) > 0
+          ? 'bidirectional'
+          : 'outgoing'
+        existing.behavior = summarizeMutualFriendBehavior(
+          existing.incomingLikeCount + existing.outgoingLikeCount,
+          existing.incomingCommentCount + existing.outgoingCommentCount
+        )
+      } else {
+        mergedMap.set(sourceProfile.displayName, {
+          name: sourceProfile.displayName,
+          incomingLikeCount: 0,
+          incomingCommentCount: 0,
+          outgoingLikeCount: reverseLikeCount,
+          outgoingCommentCount: reverseCommentCount,
+          totalCount: reverseCount,
+          latestTime: reverseLatestTime,
+          direction: 'outgoing',
+          behavior: summarizeMutualFriendBehavior(reverseLikeCount, reverseCommentCount)
+        })
+      }
+    }
+
+    const items = [...mergedMap.values()].sort((a, b) => {
+      if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount
+      if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+      return a.name.localeCompare(b.name, 'zh-CN')
+    })
+
+    return {
+      ...directMetric,
+      count: items.length,
+      items
+    }
+  }, [getSessionMutualFriendProfile])
+
+  const applySessionMutualFriendsMetric = useCallback((sessionId: string, directMetric: SessionMutualFriendsMetric) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+    sessionMutualFriendsDirectMetricsRef.current[normalizedSessionId] = directMetric
+
+    const impactedSessionIds = new Set<string>([normalizedSessionId])
+    const allSessionIds = sessionsRef.current
+      .filter(session => session.hasSession && isSingleContactSession(session.username))
+      .map(session => session.username)
+
+    for (const targetSessionId of allSessionIds) {
+      if (targetSessionId === normalizedSessionId) continue
+      const targetProfile = getSessionMutualFriendProfile(targetSessionId)
+      if (directMetric.items.some(item => targetProfile.candidateNames.has(item.name))) {
+        impactedSessionIds.add(targetSessionId)
+      }
+    }
+
+    setSessionMutualFriendsMetrics(prev => {
+      const next = { ...prev }
+      let changed = false
+      for (const targetSessionId of impactedSessionIds) {
+        const rebuiltMetric = rebuildSessionMutualFriendsMetric(targetSessionId)
+        if (!rebuiltMetric) continue
+        const previousMetric = prev[targetSessionId]
+        const previousSerialized = previousMetric ? JSON.stringify(previousMetric) : ''
+        const nextSerialized = JSON.stringify(rebuiltMetric)
+        if (previousSerialized === nextSerialized) continue
+        next[targetSessionId] = rebuiltMetric
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [getSessionMutualFriendProfile, rebuildSessionMutualFriendsMetric])
+
+  const isSessionMediaMetricReady = useCallback((sessionId: string): boolean => {
+    if (!sessionId) return true
+    if (sessionMediaMetricReadySetRef.current.has(sessionId)) return true
+    const existing = sessionContentMetricsRef.current[sessionId]
+    if (hasCompleteSessionMediaMetric(existing)) {
+      sessionMediaMetricReadySetRef.current.add(sessionId)
+      return true
+    }
+    return false
+  }, [])
+
+  const enqueueSessionMediaMetricRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    const front = options?.front === true
+    const incoming: string[] = []
+    for (const sessionIdRaw of sessionIds) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      if (sessionMediaMetricQueuedSetRef.current.has(sessionId)) continue
+      if (sessionMediaMetricLoadingSetRef.current.has(sessionId)) continue
+      if (isSessionMediaMetricReady(sessionId)) continue
+      sessionMediaMetricQueuedSetRef.current.add(sessionId)
+      incoming.push(sessionId)
+    }
+    if (incoming.length === 0) return
+    patchSessionLoadTraceStage(incoming, 'mediaMetrics', 'pending')
+    if (front) {
+      sessionMediaMetricQueueRef.current = [...incoming, ...sessionMediaMetricQueueRef.current]
+    } else {
+      sessionMediaMetricQueueRef.current.push(...incoming)
+    }
+  }, [isSessionMediaMetricReady, patchSessionLoadTraceStage])
+
+  const applySessionMediaMetricsFromStats = useCallback((data?: Record<string, SessionExportMetric>) => {
+    if (!data) return
+    const nextMetrics: Record<string, SessionContentMetric> = {}
+    let hasPatch = false
+    for (const [sessionIdRaw, metricRaw] of Object.entries(data)) {
+      const sessionId = String(sessionIdRaw || '').trim()
+      if (!sessionId) continue
+      const metric = pickSessionMediaMetric(metricRaw)
+      if (!metric) continue
+      nextMetrics[sessionId] = metric
+      hasPatch = true
+      sessionMediaMetricPendingPersistRef.current[sessionId] = {
+        ...sessionMediaMetricPendingPersistRef.current[sessionId],
+        ...metric
+      }
+      if (hasCompleteSessionMediaMetric(metric)) {
+        sessionMediaMetricReadySetRef.current.add(sessionId)
+      }
+    }
+
+    if (hasPatch) {
+      mergeSessionContentMetrics(nextMetrics)
+      scheduleFlushSessionMediaMetricCache()
+    }
+  }, [mergeSessionContentMetrics, scheduleFlushSessionMediaMetricCache])
+
+  const runSessionMediaMetricWorker = useCallback(async (runId: number) => {
+    if (sessionMediaMetricWorkerRunningRef.current) return
+    sessionMediaMetricWorkerRunningRef.current = true
+    try {
+      while (runId === sessionMediaMetricRunIdRef.current) {
+        if (isLoadingSessionCountsRef.current || detailStatsPriorityRef.current) {
+          await new Promise(resolve => window.setTimeout(resolve, 80))
+          continue
+        }
+
+        if (sessionMediaMetricQueueRef.current.length === 0) break
+
+        const batchSessionIds: string[] = []
+        while (batchSessionIds.length < SESSION_MEDIA_METRIC_BATCH_SIZE && sessionMediaMetricQueueRef.current.length > 0) {
+          const nextId = sessionMediaMetricQueueRef.current.shift()
+          if (!nextId) continue
+          sessionMediaMetricQueuedSetRef.current.delete(nextId)
+          if (sessionMediaMetricLoadingSetRef.current.has(nextId)) continue
+          if (isSessionMediaMetricReady(nextId)) continue
+          sessionMediaMetricLoadingSetRef.current.add(nextId)
+          batchSessionIds.push(nextId)
+        }
+        if (batchSessionIds.length === 0) {
+          continue
+        }
+        patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'loading')
+
+        try {
+          const cacheResult = await window.electronAPI.chat.getExportSessionStats(
+            batchSessionIds,
+            { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+          )
+          if (runId !== sessionMediaMetricRunIdRef.current) return
+          if (cacheResult.success && cacheResult.data) {
+            applySessionMediaMetricsFromStats(cacheResult.data as Record<string, SessionExportMetric>)
+          }
+
+          const missingSessionIds = batchSessionIds.filter(sessionId => !isSessionMediaMetricReady(sessionId))
+          if (missingSessionIds.length > 0) {
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              missingSessionIds,
+              { includeRelations: false, allowStaleCache: true }
+            )
+            if (runId !== sessionMediaMetricRunIdRef.current) return
+            if (freshResult.success && freshResult.data) {
+              applySessionMediaMetricsFromStats(freshResult.data as Record<string, SessionExportMetric>)
+            }
+          }
+        } catch (error) {
+          console.error('导出页加载会话媒体统计失败:', error)
+          patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'failed', {
+            error: String(error)
+          })
+        } finally {
+          const completedSessionIds: string[] = []
+          for (const sessionId of batchSessionIds) {
+            sessionMediaMetricLoadingSetRef.current.delete(sessionId)
+            if (isSessionMediaMetricReady(sessionId)) {
+              sessionMediaMetricReadySetRef.current.add(sessionId)
+              completedSessionIds.push(sessionId)
+            }
+          }
+          if (completedSessionIds.length > 0) {
+            patchSessionLoadTraceStage(completedSessionIds, 'mediaMetrics', 'done')
+          }
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    } finally {
+      sessionMediaMetricWorkerRunningRef.current = false
+      if (runId === sessionMediaMetricRunIdRef.current && sessionMediaMetricQueueRef.current.length > 0) {
+        void runSessionMediaMetricWorker(runId)
+      }
+    }
+  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
+
+  const scheduleSessionMediaMetricWorker = useCallback(() => {
+    if (!isSessionCountStageReady) return
+    if (isLoadingSessionCountsRef.current) return
+    if (sessionMediaMetricWorkerRunningRef.current) return
+    const runId = sessionMediaMetricRunIdRef.current
+    void runSessionMediaMetricWorker(runId)
+  }, [isSessionCountStageReady, runSessionMediaMetricWorker])
+
+  const loadSessionMutualFriendsMetric = useCallback(async (sessionId: string): Promise<SessionMutualFriendsMetric> => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const hasKnownTotal = Object.prototype.hasOwnProperty.call(snsUserPostCounts, normalizedSessionId)
+    const knownTotalRaw = hasKnownTotal ? Number(snsUserPostCounts[normalizedSessionId] || 0) : NaN
+    const knownTotal = Number.isFinite(knownTotalRaw) ? Math.max(0, Math.floor(knownTotalRaw)) : null
+    const allPosts: SnsPost[] = []
+    let endTime: number | undefined
+    let hasMore = true
+
+    while (hasMore) {
+      const result = await window.electronAPI.sns.getTimeline(
+        SNS_RANK_PAGE_SIZE,
+        0,
+        [normalizedSessionId],
+        '',
+        undefined,
+        endTime
+      )
+      if (!result.success) {
+        throw new Error(result.error || '共同好友统计失败')
+      }
+
+      const pagePosts = Array.isArray(result.timeline)
+        ? [...(result.timeline as SnsPost[])].sort((a, b) => b.createTime - a.createTime)
+        : []
+      if (pagePosts.length === 0) {
+        hasMore = false
+        break
+      }
+
+      allPosts.push(...pagePosts)
+      endTime = pagePosts[pagePosts.length - 1].createTime - 1
+      hasMore = pagePosts.length >= SNS_RANK_PAGE_SIZE
+    }
+
+    return buildSessionMutualFriendsMetric(allPosts, knownTotal)
+  }, [snsUserPostCounts])
+
+  const runSessionMutualFriendsWorker = useCallback(async (runId: number) => {
+    if (sessionMutualFriendsWorkerRunningRef.current) return
+    sessionMutualFriendsWorkerRunningRef.current = true
+    try {
+      while (runId === sessionMutualFriendsRunIdRef.current) {
+        if (hasPendingMetricLoads()) {
+          await new Promise(resolve => window.setTimeout(resolve, 120))
+          continue
+        }
+
+        const sessionId = sessionMutualFriendsQueueRef.current.shift()
+        if (!sessionId) break
+        sessionMutualFriendsQueuedSetRef.current.delete(sessionId)
+        if (sessionMutualFriendsLoadingSetRef.current.has(sessionId)) continue
+        if (isSessionMutualFriendsReady(sessionId)) continue
+
+        sessionMutualFriendsLoadingSetRef.current.add(sessionId)
+        patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'loading')
+
+        try {
+          const metric = await loadSessionMutualFriendsMetric(sessionId)
+          if (runId !== sessionMutualFriendsRunIdRef.current) return
+          applySessionMutualFriendsMetric(sessionId, metric)
+          sessionMutualFriendsReadySetRef.current.add(sessionId)
+          patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'done')
+        } catch (error) {
+          console.error('导出页加载共同好友统计失败:', error)
+          patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'failed', {
+            error: error instanceof Error ? error.message : String(error)
+          })
+        } finally {
+          sessionMutualFriendsLoadingSetRef.current.delete(sessionId)
+        }
+
+        await new Promise(resolve => window.setTimeout(resolve, 0))
+      }
+    } finally {
+      sessionMutualFriendsWorkerRunningRef.current = false
+      if (runId === sessionMutualFriendsRunIdRef.current && sessionMutualFriendsQueueRef.current.length > 0) {
+        void runSessionMutualFriendsWorker(runId)
+      }
+    }
+  }, [
+    applySessionMutualFriendsMetric,
+    hasPendingMetricLoads,
+    isSessionMutualFriendsReady,
+    loadSessionMutualFriendsMetric,
+    patchSessionLoadTraceStage
+  ])
+
+  const scheduleSessionMutualFriendsWorker = useCallback(() => {
+    if (!isSessionCountStageReady) return
+    if (hasPendingMetricLoads()) return
+    if (sessionMutualFriendsWorkerRunningRef.current) return
+    const runId = sessionMutualFriendsRunIdRef.current
+    void runSessionMutualFriendsWorker(runId)
+  }, [hasPendingMetricLoads, isSessionCountStageReady, runSessionMutualFriendsWorker])
+
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
     priorityTab: ConversationTab,
@@ -1829,8 +3115,12 @@ function ExportPage() {
     const requestId = sessionCountRequestIdRef.current + 1
     sessionCountRequestIdRef.current = requestId
     const isStale = () => sessionCountRequestIdRef.current !== requestId
+    setIsSessionCountStageReady(false)
 
     const exportableSessions = sourceSessions.filter(session => session.hasSession)
+    const exportableSessionIds = exportableSessions.map(session => session.username)
+    const exportableSessionIdSet = new Set(exportableSessionIds)
+    patchSessionLoadTraceStage(exportableSessionIds, 'messageCount', 'pending', { force: true })
     const seededHintCounts = exportableSessions.reduce<Record<string, number>>((acc, session) => {
       const nextCount = normalizeMessageCount(session.messageCountHint)
       if (typeof nextCount === 'number') {
@@ -1839,12 +3129,17 @@ function ExportPage() {
       return acc
     }, {})
     const seededPersistentCounts = Object.entries(options?.seededCounts || {}).reduce<Record<string, number>>((acc, [sessionId, countRaw]) => {
+      if (!exportableSessionIdSet.has(sessionId)) return acc
       const nextCount = normalizeMessageCount(countRaw)
       if (typeof nextCount === 'number') {
         acc[sessionId] = nextCount
       }
       return acc
     }, {})
+    const seededPersistentSessionIds = Object.keys(seededPersistentCounts)
+    if (seededPersistentSessionIds.length > 0) {
+      patchSessionLoadTraceStage(seededPersistentSessionIds, 'messageCount', 'done')
+    }
     const seededCounts = { ...seededHintCounts, ...seededPersistentCounts }
     const accumulatedCounts: Record<string, number> = { ...seededCounts }
     setSessionMessageCounts(seededCounts)
@@ -1859,6 +3154,9 @@ function ExportPage() {
 
     if (exportableSessions.length === 0) {
       setIsLoadingSessionCounts(false)
+      if (!isStale()) {
+        setIsSessionCountStageReady(true)
+      }
       return { ...accumulatedCounts }
     }
 
@@ -1894,26 +3192,54 @@ function ExportPage() {
 
     setIsLoadingSessionCounts(true)
     try {
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (prioritizedSessionIds.length > 0) {
+        patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'loading')
         const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
         if (isStale()) return { ...accumulatedCounts }
         if (priorityResult.success) {
           applyCounts(priorityResult.counts)
+          patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'done')
+        } else {
+          patchSessionLoadTraceStage(
+            prioritizedSessionIds,
+            'messageCount',
+            'failed',
+            { error: priorityResult.error || '总消息数加载失败' }
+          )
         }
       }
 
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (remainingSessionIds.length > 0) {
+        patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'loading')
         const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
         if (isStale()) return { ...accumulatedCounts }
         if (remainingResult.success) {
           applyCounts(remainingResult.counts)
+          patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'done')
+        } else {
+          patchSessionLoadTraceStage(
+            remainingSessionIds,
+            'messageCount',
+            'failed',
+            { error: remainingResult.error || '总消息数加载失败' }
+          )
         }
       }
     } catch (error) {
       console.error('导出页加载会话消息总数失败:', error)
+      patchSessionLoadTraceStage(exportableSessionIds, 'messageCount', 'failed', {
+        error: String(error)
+      })
     } finally {
       if (!isStale()) {
         setIsLoadingSessionCounts(false)
+        setIsSessionCountStageReady(true)
         if (options?.scopeKey && Object.keys(accumulatedCounts).length > 0) {
           try {
             await configService.setExportSessionMessageCountCache(options.scopeKey, accumulatedCounts)
@@ -1924,18 +3250,36 @@ function ExportPage() {
       }
     }
     return { ...accumulatedCounts }
-  }, [mergeSessionContentMetrics])
+  }, [mergeSessionContentMetrics, patchSessionLoadTraceStage])
 
   const loadSessions = useCallback(async () => {
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
     sessionsHydratedAtRef.current = 0
+    sessionPreciseRefreshAtRef.current = {}
+    resetSessionMediaMetricLoader()
+    resetSessionMutualFriendsLoader()
     setIsLoading(true)
     setIsSessionEnriching(false)
     sessionCountRequestIdRef.current += 1
     setSessionMessageCounts({})
     setSessionContentMetrics({})
+    setSessionMutualFriendsMetrics({})
+    sessionMutualFriendsMetricsRef.current = {}
+    setSessionMutualFriendsDialogTarget(null)
+    setSessionMutualFriendsSearch('')
+    setSessionLoadTraceMap({})
+    setSessionLoadProgressPulseMap({})
+    sessionLoadProgressSnapshotRef.current = {}
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+    setSnsUserPostCounts({})
+    setSnsUserPostCountsStatus('idle')
     setIsLoadingSessionCounts(false)
+    setIsSessionCountStageReady(false)
 
     const isStale = () => sessionLoadTokenRef.current !== loadToken
 
@@ -1945,10 +3289,12 @@ function ExportPage() {
 
       const [
         cachedContactsPayload,
-        cachedMessageCountsPayload
+        cachedMessageCountsPayload,
+        cachedContentMetricsPayload
       ] = await Promise.all([
         loadContactsCaches(scopeKey),
-        configService.getExportSessionMessageCountCache(scopeKey)
+        configService.getExportSessionMessageCountCache(scopeKey),
+        configService.getExportSessionContentMetricCache(scopeKey)
       ])
       if (isStale()) return
 
@@ -1962,7 +3308,7 @@ function ExportPage() {
       const cachedContactMap = toContactMapFromCaches(cachedContacts, cachedAvatarEntries)
       if (cachedContacts.length > 0) {
         syncContactTypeCounts(Object.values(cachedContactMap))
-        setSessions(toSessionRowsWithContacts([], cachedContactMap))
+        setSessions(toSessionRowsWithContacts([], cachedContactMap).filter(isExportConversationSession))
         setSessionDataSource('cache')
         setIsLoading(false)
       }
@@ -1981,7 +3327,7 @@ function ExportPage() {
 
       if (sessionsResult.success && sessionsResult.sessions) {
         const rawSessions = sessionsResult.sessions
-        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap)
+        const baseSessions = toSessionRowsWithContacts(rawSessions, cachedContactMap).filter(isExportConversationSession)
         const exportableSessionIds = baseSessions
           .filter((session) => session.hasSession)
           .map((session) => session.username)
@@ -2000,6 +3346,22 @@ function ExportPage() {
           acc[sessionId] = { totalMessages: count }
           return acc
         }, {})
+        const cachedContentMetrics = Object.entries(cachedContentMetricsPayload?.metrics || {}).reduce<Record<string, SessionContentMetric>>((acc, [sessionId, rawMetric]) => {
+          if (!exportableSessionIdSet.has(sessionId)) return acc
+          const metric = pickSessionMediaMetric(rawMetric)
+          if (!metric) return acc
+          acc[sessionId] = metric
+          if (hasCompleteSessionMediaMetric(metric)) {
+            sessionMediaMetricReadySetRef.current.add(sessionId)
+          }
+          return acc
+        }, {})
+        const cachedContentMetricReadySessionIds = Object.entries(cachedContentMetrics)
+          .filter(([, metric]) => hasCompleteSessionMediaMetric(metric))
+          .map(([sessionId]) => sessionId)
+        if (cachedContentMetricReadySessionIds.length > 0) {
+          patchSessionLoadTraceStage(cachedContentMetricReadySessionIds, 'mediaMetrics', 'done')
+        }
 
         if (isStale()) return
         if (Object.keys(cachedMessageCounts).length > 0) {
@@ -2007,6 +3369,9 @@ function ExportPage() {
         }
         if (Object.keys(cachedCountAsMetrics).length > 0) {
           mergeSessionContentMetrics(cachedCountAsMetrics)
+        }
+        if (Object.keys(cachedContentMetrics).length > 0) {
+          mergeSessionContentMetrics(cachedContentMetrics)
         }
         setSessions(baseSessions)
         sessionsHydratedAtRef.current = Date.now()
@@ -2027,12 +3392,14 @@ function ExportPage() {
         setIsSessionEnriching(true)
         void (async () => {
           try {
+            if (detailStatsPriorityRef.current) return
             let contactMap = { ...cachedContactMap }
             let avatarEntries = { ...cachedAvatarEntries }
             let hasFreshNetworkData = false
             let hasNetworkContactsSnapshot = false
 
             if (isStale()) return
+            if (detailStatsPriorityRef.current) return
             const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
             if (isStale()) return
 
@@ -2091,6 +3458,7 @@ function ExportPage() {
             if (needsEnrichment.length > 0) {
               for (let i = 0; i < needsEnrichment.length; i += EXPORT_AVATAR_ENRICH_BATCH_SIZE) {
                 if (isStale()) return
+                if (detailStatsPriorityRef.current) return
                 const batch = needsEnrichment.slice(i, i + EXPORT_AVATAR_ENRICH_BATCH_SIZE)
                 if (batch.length === 0) continue
                 try {
@@ -2152,7 +3520,7 @@ function ExportPage() {
             }, contactMap)
 
             if (isStale()) return
-            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap)
+            const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap).filter(isExportConversationSession)
               .map((session) => {
                 const extra = extraContactMap[session.username]
                 const displayName = extra?.displayName || session.displayName || session.username
@@ -2205,7 +3573,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, loadSessionMessageCounts, mergeSessionContentMetrics, patchSessionLoadTraceStage, resetSessionMediaMetricLoader, resetSessionMutualFriendsLoader, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
@@ -2237,9 +3605,22 @@ function ExportPage() {
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     sessionLoadTokenRef.current = Date.now()
     sessionCountRequestIdRef.current += 1
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+    resetSessionMutualFriendsLoader()
     setIsSessionEnriching(false)
     setIsLoadingSessionCounts(false)
-  }, [isExportRoute])
+    setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
+  }, [isExportRoute, resetSessionMutualFriendsLoader])
+
+  useEffect(() => {
+    if (activeTab === 'official') {
+      setActiveTab('private')
+    }
+  }, [activeTab])
 
   useEffect(() => {
     activeTabRef.current = activeTab
@@ -2305,15 +3686,30 @@ function ExportPage() {
   const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open'>) => {
     setExportDialog({ open: true, ...payload })
     setIsTimeRangeDialogOpen(false)
-    setTimeRangePreset('all')
+    setTimeRangeSelection(exportDefaultDateRangeSelection)
 
     setOptions(prev => {
-      const nextDateRange = prev.dateRange ?? createDefaultDateRange()
+      const nextDateRange = cloneExportDateRange(exportDefaultDateRangeSelection.dateRange)
 
       const next: ExportOptions = {
         ...prev,
-        useAllTime: true,
-        dateRange: nextDateRange
+        format: exportDefaultFormat,
+        exportAvatars: exportDefaultAvatars,
+        useAllTime: exportDefaultDateRangeSelection.useAllTime,
+        dateRange: nextDateRange,
+        exportMedia: Boolean(
+          exportDefaultMedia.images ||
+          exportDefaultMedia.voices ||
+          exportDefaultMedia.videos ||
+          exportDefaultMedia.emojis
+        ),
+        exportImages: exportDefaultMedia.images,
+        exportVoices: exportDefaultMedia.voices,
+        exportVideos: exportDefaultMedia.videos,
+        exportEmojis: exportDefaultMedia.emojis,
+        exportVoiceAsText: exportDefaultVoiceAsText,
+        excelCompactColumns: exportDefaultExcelCompactColumns,
+        exportConcurrency: exportDefaultConcurrency
       }
 
       if (payload.scope === 'sns') {
@@ -2327,7 +3723,6 @@ function ExportPage() {
           next.exportVoices = false
           next.exportVideos = false
           next.exportEmojis = false
-          next.exportAvatars = true
         } else {
           next.exportMedia = true
           next.exportImages = payload.contentType === 'image'
@@ -2340,219 +3735,30 @@ function ExportPage() {
 
       return next
     })
-  }, [])
+  }, [
+    exportDefaultDateRangeSelection,
+    exportDefaultExcelCompactColumns,
+    exportDefaultFormat,
+    exportDefaultAvatars,
+    exportDefaultMedia,
+    exportDefaultVoiceAsText,
+    exportDefaultConcurrency
+  ])
 
   const closeExportDialog = useCallback(() => {
     setExportDialog(prev => ({ ...prev, open: false }))
     setIsTimeRangeDialogOpen(false)
-    setTimeRangeDialogDraft(null)
-    setTimeRangeDateInput({ start: '', end: '' })
-    setTimeRangeDateInputError({ start: false, end: false })
   }, [])
 
-  const buildTimeRangeDialogDraft = useCallback((): TimeRangeDialogDraft => {
-    const dateRange = options.dateRange ?? createDefaultDateRange()
-    return {
-      preset: timeRangePreset,
-      useAllTime: options.useAllTime,
-      dateRange: {
-        start: new Date(dateRange.start),
-        end: new Date(dateRange.end)
-      },
-      startPanelMonth: toMonthStart(dateRange.start),
-      endPanelMonth: toMonthStart(dateRange.end)
-    }
-  }, [options.dateRange, options.useAllTime, timeRangePreset])
-
   const openTimeRangeDialog = useCallback(() => {
-    const draft = buildTimeRangeDialogDraft()
-    setTimeRangeDialogDraft(draft)
     setIsTimeRangeDialogOpen(true)
-  }, [buildTimeRangeDialogDraft])
+  }, [])
 
   const closeTimeRangeDialog = useCallback(() => {
     setIsTimeRangeDialogOpen(false)
-    setTimeRangeDialogDraft(null)
-    setTimeRangeDateInput({ start: '', end: '' })
-    setTimeRangeDateInputError({ start: false, end: false })
   }, [])
 
-  const applyTimeRangePresetToDraft = useCallback((preset: Exclude<DateRangePreset, 'custom'>) => {
-    setTimeRangeDialogDraft(prev => {
-      const base = prev ?? buildTimeRangeDialogDraft()
-      if (preset === 'all') {
-        const previewRange = createDefaultDateRange()
-        return {
-          ...base,
-          preset,
-          useAllTime: true,
-          dateRange: {
-            start: previewRange.start,
-            end: previewRange.end
-          },
-          startPanelMonth: toMonthStart(previewRange.start),
-          endPanelMonth: toMonthStart(previewRange.end)
-        }
-      }
-      const range = createDateRangeByPreset(preset)
-      return {
-        ...base,
-        preset,
-        useAllTime: false,
-        dateRange: {
-          start: range.start,
-          end: range.end
-        },
-        startPanelMonth: toMonthStart(range.start),
-        endPanelMonth: toMonthStart(range.end)
-      }
-    })
-  }, [buildTimeRangeDialogDraft])
-
-  const handleTimeRangePresetClick = useCallback((preset: Exclude<DateRangePreset, 'custom'>) => {
-    applyTimeRangePresetToDraft(preset)
-  }, [applyTimeRangePresetToDraft])
-
-  const updateTimeRangeDraftStart = useCallback((targetDate: Date) => {
-    const start = startOfDay(targetDate)
-    setTimeRangeDialogDraft(prev => {
-      const base = prev ?? buildTimeRangeDialogDraft()
-      const nextEnd = base.dateRange.end < start ? endOfDay(start) : base.dateRange.end
-      return {
-        ...base,
-        preset: 'custom',
-        useAllTime: false,
-        dateRange: {
-          start,
-          end: nextEnd
-        },
-        startPanelMonth: toMonthStart(start),
-        endPanelMonth: toMonthStart(nextEnd)
-      }
-    })
-  }, [buildTimeRangeDialogDraft])
-
-  const updateTimeRangeDraftEnd = useCallback((targetDate: Date) => {
-    const end = endOfDay(targetDate)
-    setTimeRangeDialogDraft(prev => {
-      const base = prev ?? buildTimeRangeDialogDraft()
-      const isAllTimeMode = base.useAllTime
-      const nextStart = isAllTimeMode
-        ? startOfDay(targetDate)
-        : base.dateRange.start
-      const nextEnd = end < nextStart ? endOfDay(nextStart) : end
-      return {
-        ...base,
-        preset: 'custom',
-        useAllTime: false,
-        dateRange: {
-          start: nextStart,
-          end: nextEnd
-        },
-        startPanelMonth: toMonthStart(nextStart),
-        endPanelMonth: toMonthStart(nextEnd)
-      }
-    })
-  }, [buildTimeRangeDialogDraft])
-
-  const commitTimeRangeStartFromInput = useCallback(() => {
-    const parsed = parseDateInputValue(timeRangeDateInput.start)
-    if (!parsed) {
-      setTimeRangeDateInputError(prev => ({ ...prev, start: true }))
-      return
-    }
-    setTimeRangeDateInputError(prev => ({ ...prev, start: false }))
-    updateTimeRangeDraftStart(parsed)
-  }, [timeRangeDateInput.start, updateTimeRangeDraftStart])
-
-  const commitTimeRangeEndFromInput = useCallback(() => {
-    const parsed = parseDateInputValue(timeRangeDateInput.end)
-    if (!parsed) {
-      setTimeRangeDateInputError(prev => ({ ...prev, end: true }))
-      return
-    }
-    setTimeRangeDateInputError(prev => ({ ...prev, end: false }))
-    updateTimeRangeDraftEnd(parsed)
-  }, [timeRangeDateInput.end, updateTimeRangeDraftEnd])
-
-  const shiftTimeRangePanelMonth = useCallback((panel: 'start' | 'end', delta: number) => {
-    setTimeRangeDialogDraft(prev => {
-      const base = prev ?? buildTimeRangeDialogDraft()
-      if (panel === 'start') {
-        return {
-          ...base,
-          startPanelMonth: addMonths(base.startPanelMonth, delta)
-        }
-      }
-      return {
-        ...base,
-        endPanelMonth: addMonths(base.endPanelMonth, delta)
-      }
-    })
-  }, [buildTimeRangeDialogDraft])
-
-  const commitTimeRangeDialogDraft = useCallback(() => {
-    const draft = timeRangeDialogDraft ?? buildTimeRangeDialogDraft()
-    setTimeRangePreset(draft.preset)
-    setOptions(prev => ({
-      ...prev,
-      useAllTime: draft.useAllTime,
-      dateRange: {
-        start: new Date(draft.dateRange.start),
-        end: new Date(draft.dateRange.end)
-      }
-    }))
-    closeTimeRangeDialog()
-  }, [buildTimeRangeDialogDraft, closeTimeRangeDialog, timeRangeDialogDraft])
-
-  const timeRangeSummaryLabel = useMemo(() => {
-    if (options.useAllTime) return '默认导出全部时间'
-    if (timeRangePreset === 'today') return '今天'
-    if (timeRangePreset === 'yesterday') return '昨天'
-    if (timeRangePreset === 'last3days') return '最近3天'
-    if (timeRangePreset === 'last7days') return '最近一周'
-    if (timeRangePreset === 'last30days') return '最近30 天'
-    if (timeRangePreset === 'last1year') return '最近一年'
-    if (timeRangePreset === 'last2years') return '最近两年'
-    if (options.dateRange) {
-      return `${formatDateInputValue(options.dateRange.start)} 至 ${formatDateInputValue(options.dateRange.end)}`
-    }
-    return '自定义时间范围'
-  }, [options.useAllTime, options.dateRange, timeRangePreset])
-
-  const activeTimeRangeDialogDraft = timeRangeDialogDraft ?? buildTimeRangeDialogDraft()
-  const isRangeModeActive = !activeTimeRangeDialogDraft.useAllTime
-  const timeRangeModeText = isRangeModeActive
-    ? '当前导出模式：按时间范围导出'
-    : '当前导出模式：全部时间导出（选择下方日期将切换为按时间范围导出）'
-
-  useEffect(() => {
-    if (!isTimeRangeDialogOpen) return
-    setTimeRangeDateInput({
-      start: formatDateInputValue(activeTimeRangeDialogDraft.dateRange.start),
-      end: formatDateInputValue(activeTimeRangeDialogDraft.dateRange.end)
-    })
-    setTimeRangeDateInputError({ start: false, end: false })
-  }, [
-    isTimeRangeDialogOpen,
-    activeTimeRangeDialogDraft.dateRange.start.getTime(),
-    activeTimeRangeDialogDraft.dateRange.end.getTime()
-  ])
-
-  const isTimeRangePresetActive = useCallback((preset: DateRangePreset): boolean => {
-    if (preset === 'all') return activeTimeRangeDialogDraft.useAllTime
-    return !activeTimeRangeDialogDraft.useAllTime && activeTimeRangeDialogDraft.preset === preset
-  }, [activeTimeRangeDialogDraft])
-
-  const startPanelCells = useMemo(
-    () => buildCalendarCells(activeTimeRangeDialogDraft.startPanelMonth),
-    [activeTimeRangeDialogDraft.startPanelMonth]
-  )
-
-  const endPanelCells = useMemo(
-    () => buildCalendarCells(activeTimeRangeDialogDraft.endPanelMonth),
-    [activeTimeRangeDialogDraft.endPanelMonth]
-  )
+  const timeRangeSummaryLabel = useMemo(() => getExportDateRangeLabel(timeRangeSelection), [timeRangeSelection])
 
   useEffect(() => {
     const unsubscribe = onOpenSingleExport((payload) => {
@@ -2644,7 +3850,7 @@ function ExportPage() {
           format: fastTextFormat,
           contentType,
           exportConcurrency: textExportConcurrency,
-          exportAvatars: true,
+          exportAvatars: base.exportAvatars,
           exportMedia: false,
           exportImages: false,
           exportVoices: false,
@@ -3057,7 +4263,13 @@ function ExportPage() {
     closeExportDialog()
 
     await configService.setExportDefaultFormat(options.format)
-    await configService.setExportDefaultMedia(Boolean(options.exportImages || options.exportVoices || options.exportVideos || options.exportEmojis))
+    await configService.setExportDefaultAvatars(options.exportAvatars)
+    await configService.setExportDefaultMedia({
+      images: options.exportImages,
+      voices: options.exportVoices,
+      videos: options.exportVideos,
+      emojis: options.exportEmojis
+    })
     await configService.setExportDefaultVoiceAsText(options.exportVoiceAsText)
     await configService.setExportDefaultExcelCompactColumns(options.excelCompactColumns)
     await configService.setExportDefaultTxtColumns(options.txtColumns)
@@ -3280,9 +4492,17 @@ function ExportPage() {
   const activeTabLabel = useMemo(() => {
     if (activeTab === 'private') return '私聊'
     if (activeTab === 'group') return '群聊'
-    if (activeTab === 'former_friend') return '曾经的好友'
-    return '公众号'
+    return '曾经的好友'
   }, [activeTab])
+  const contactsHeaderMainLabel = useMemo(() => {
+    if (activeTab === 'group') return '群聊名称'
+    if (activeTab === 'private' || activeTab === 'former_friend') return '联系人'
+    return '联系人（头像/名称/微信号）'
+  }, [activeTab])
+  const shouldShowSnsColumn = useMemo(() => (
+    activeTab === 'private' || activeTab === 'former_friend'
+  ), [activeTab])
+  const shouldShowMutualFriendsColumn = shouldShowSnsColumn
 
   const sessionRowByUsername = useMemo(() => {
     const map = new Map<string, SessionRow>()
@@ -3336,10 +4556,394 @@ function ExportPage() {
     return indexedContacts.map(item => item.contact)
   }, [contactsList, activeTab, searchKeyword, sessionMessageCounts, sessionRowByUsername])
 
+  const keywordMatchedContactUsernameSet = useMemo(() => {
+    const keyword = searchKeyword.trim().toLowerCase()
+    const matched = new Set<string>()
+    for (const contact of contactsList) {
+      if (!contact?.username) continue
+      if (!keyword) {
+        matched.add(contact.username)
+        continue
+      }
+      if (
+        (contact.displayName || '').toLowerCase().includes(keyword) ||
+        (contact.remark || '').toLowerCase().includes(keyword) ||
+        (contact.nickname || '').toLowerCase().includes(keyword) ||
+        (contact.alias || '').toLowerCase().includes(keyword) ||
+        contact.username.toLowerCase().includes(keyword)
+      ) {
+        matched.add(contact.username)
+      }
+    }
+    return matched
+  }, [contactsList, searchKeyword])
+
+  const loadDetailTargetsByTab = useMemo(() => {
+    const targets: Record<ConversationTab, string[]> = {
+      private: [],
+      group: [],
+      official: [],
+      former_friend: []
+    }
+    for (const session of sessions) {
+      if (!session.hasSession) continue
+      if (!keywordMatchedContactUsernameSet.has(session.username)) continue
+      targets[session.kind].push(session.username)
+    }
+    return targets
+  }, [keywordMatchedContactUsernameSet, sessions])
+
+  const formatLoadDetailTime = useCallback((value?: number): string => {
+    if (!value || !Number.isFinite(value)) return '--'
+    return new Date(value).toLocaleTimeString('zh-CN', { hour12: false })
+  }, [])
+
+  const getLoadDetailStatusLabel = useCallback((loaded: number, total: number, hasStarted: boolean): string => {
+    if (total <= 0) return '待加载'
+    if (loaded >= total) return `已完成 ${total}`
+    if (hasStarted) return `加载中 ${loaded}/${total}`
+    return '待加载'
+  }, [])
+
+  const summarizeLoadTraceForTab = useCallback((
+    sessionIds: string[],
+    stageKey: keyof SessionLoadTraceState
+  ): SessionLoadStageSummary => {
+    const total = sessionIds.length
+    let loaded = 0
+    let hasStarted = false
+    let earliestStart: number | undefined
+    let latestFinish: number | undefined
+    let latestProgressAt: number | undefined
+    for (const sessionId of sessionIds) {
+      const stage = sessionLoadTraceMap[sessionId]?.[stageKey]
+      if (stage?.status === 'done') {
+        loaded += 1
+        if (typeof stage.finishedAt === 'number') {
+          latestProgressAt = latestProgressAt === undefined
+            ? stage.finishedAt
+            : Math.max(latestProgressAt, stage.finishedAt)
+        }
+      }
+      if (stage?.status === 'loading' || stage?.status === 'failed' || typeof stage?.startedAt === 'number') {
+        hasStarted = true
+      }
+      if (typeof stage?.startedAt === 'number') {
+        earliestStart = earliestStart === undefined
+          ? stage.startedAt
+          : Math.min(earliestStart, stage.startedAt)
+      }
+      if (typeof stage?.finishedAt === 'number') {
+        latestFinish = latestFinish === undefined
+          ? stage.finishedAt
+          : Math.max(latestFinish, stage.finishedAt)
+      }
+    }
+    return {
+      total,
+      loaded,
+      statusLabel: getLoadDetailStatusLabel(loaded, total, hasStarted),
+      startedAt: earliestStart,
+      finishedAt: loaded >= total ? latestFinish : undefined,
+      latestProgressAt
+    }
+  }, [getLoadDetailStatusLabel, sessionLoadTraceMap])
+
+  const createNotApplicableLoadSummary = useCallback((): SessionLoadStageSummary => {
+    return {
+      total: 0,
+      loaded: 0,
+      statusLabel: '不适用'
+    }
+  }, [])
+
+  const sessionLoadDetailRows = useMemo(() => {
+    const tabOrder: ConversationTab[] = ['private', 'group', 'former_friend']
+    return tabOrder.map((tab) => {
+      const sessionIds = loadDetailTargetsByTab[tab] || []
+      const snsSessionIds = sessionIds.filter((sessionId) => isSingleContactSession(sessionId))
+      const snsPostCounts = tab === 'private' || tab === 'former_friend'
+        ? summarizeLoadTraceForTab(snsSessionIds, 'snsPostCounts')
+        : createNotApplicableLoadSummary()
+      const mutualFriends = tab === 'private' || tab === 'former_friend'
+        ? summarizeLoadTraceForTab(snsSessionIds, 'mutualFriends')
+        : createNotApplicableLoadSummary()
+      return {
+        tab,
+        label: conversationTabLabels[tab],
+        messageCount: summarizeLoadTraceForTab(sessionIds, 'messageCount'),
+        mediaMetrics: summarizeLoadTraceForTab(sessionIds, 'mediaMetrics'),
+        snsPostCounts,
+        mutualFriends
+      }
+    })
+  }, [createNotApplicableLoadSummary, loadDetailTargetsByTab, summarizeLoadTraceForTab])
+
+  const formatLoadDetailPulseTime = useCallback((value?: number): string => {
+    if (!value || !Number.isFinite(value)) return '--'
+    return new Date(value).toLocaleTimeString('zh-CN', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    })
+  }, [])
+
+  useEffect(() => {
+    const previousSnapshot = sessionLoadProgressSnapshotRef.current
+    const nextSnapshot: Record<string, { loaded: number; total: number }> = {}
+    const resetKeys: string[] = []
+    const updates: Array<{ key: string; at: number; delta: number }> = []
+    const stageKeys: Array<keyof SessionLoadTraceState> = ['messageCount', 'mediaMetrics', 'snsPostCounts', 'mutualFriends']
+
+    for (const row of sessionLoadDetailRows) {
+      for (const stageKey of stageKeys) {
+        const summary = row[stageKey]
+        const key = `${stageKey}:${row.tab}`
+        const loaded = Number.isFinite(summary.loaded) ? Math.max(0, Math.floor(summary.loaded)) : 0
+        const total = Number.isFinite(summary.total) ? Math.max(0, Math.floor(summary.total)) : 0
+        nextSnapshot[key] = { loaded, total }
+
+        const previous = previousSnapshot[key]
+        if (!previous || previous.total !== total || loaded < previous.loaded) {
+          resetKeys.push(key)
+          continue
+        }
+        if (loaded > previous.loaded) {
+          updates.push({
+            key,
+            at: summary.latestProgressAt || Date.now(),
+            delta: loaded - previous.loaded
+          })
+        }
+      }
+    }
+
+    sessionLoadProgressSnapshotRef.current = nextSnapshot
+    if (resetKeys.length === 0 && updates.length === 0) return
+
+    setSessionLoadProgressPulseMap(prev => {
+      let changed = false
+      const next = { ...prev }
+      for (const key of resetKeys) {
+        if (!(key in next)) continue
+        delete next[key]
+        changed = true
+      }
+      for (const update of updates) {
+        const previous = next[update.key]
+        if (previous && previous.at === update.at && previous.delta === update.delta) continue
+        next[update.key] = { at: update.at, delta: update.delta }
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [sessionLoadDetailRows])
+
   useEffect(() => {
     contactsVirtuosoRef.current?.scrollToIndex({ index: 0, align: 'start' })
     setIsContactsListAtTop(true)
   }, [activeTab, searchKeyword])
+
+  const collectVisibleSessionMetricTargets = useCallback((sourceContacts: ContactInfo[]): string[] => {
+    if (sourceContacts.length === 0) return []
+    const startCandidate = sessionMediaMetricVisibleRangeRef.current.startIndex
+    const endCandidate = sessionMediaMetricVisibleRangeRef.current.endIndex
+    const startIndex = Math.max(0, Math.min(sourceContacts.length - 1, startCandidate >= 0 ? startCandidate : 0))
+    const visibleEnd = endCandidate >= startIndex
+      ? endCandidate
+      : Math.min(sourceContacts.length - 1, startIndex + 9)
+    const endIndex = Math.max(startIndex, Math.min(sourceContacts.length - 1, visibleEnd + SESSION_MEDIA_METRIC_PREFETCH_ROWS))
+    const sessionIds: string[] = []
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const contact = sourceContacts[index]
+      if (!contact?.username) continue
+      const mappedSession = sessionRowByUsername.get(contact.username)
+      if (!mappedSession?.hasSession) continue
+      sessionIds.push(contact.username)
+    }
+    return sessionIds
+  }, [sessionRowByUsername])
+
+  const collectVisibleSessionMutualFriendsTargets = useCallback((sourceContacts: ContactInfo[]): string[] => {
+    if (sourceContacts.length === 0) return []
+    const startCandidate = sessionMutualFriendsVisibleRangeRef.current.startIndex
+    const endCandidate = sessionMutualFriendsVisibleRangeRef.current.endIndex
+    const startIndex = Math.max(0, Math.min(sourceContacts.length - 1, startCandidate >= 0 ? startCandidate : 0))
+    const visibleEnd = endCandidate >= startIndex
+      ? endCandidate
+      : Math.min(sourceContacts.length - 1, startIndex + 9)
+    const endIndex = Math.max(startIndex, Math.min(sourceContacts.length - 1, visibleEnd + SESSION_MEDIA_METRIC_PREFETCH_ROWS))
+    const sessionIds: string[] = []
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const contact = sourceContacts[index]
+      if (!contact?.username || !isSingleContactSession(contact.username)) continue
+      const mappedSession = sessionRowByUsername.get(contact.username)
+      if (!mappedSession?.hasSession) continue
+      sessionIds.push(contact.username)
+    }
+    return sessionIds
+  }, [sessionRowByUsername])
+
+  const handleContactsRangeChanged = useCallback((range: { startIndex: number; endIndex: number }) => {
+    const startIndex = Number.isFinite(range?.startIndex) ? Math.max(0, Math.floor(range.startIndex)) : 0
+    const endIndex = Number.isFinite(range?.endIndex) ? Math.max(startIndex, Math.floor(range.endIndex)) : startIndex
+    sessionMediaMetricVisibleRangeRef.current = { startIndex, endIndex }
+    sessionMutualFriendsVisibleRangeRef.current = { startIndex, endIndex }
+    if (isLoadingSessionCountsRef.current || !isSessionCountStageReady) return
+    const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
+    if (visibleTargets.length === 0) return
+    enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
+    scheduleSessionMediaMetricWorker()
+    const visibleMutualFriendsTargets = collectVisibleSessionMutualFriendsTargets(filteredContacts)
+    if (visibleMutualFriendsTargets.length > 0) {
+      enqueueSessionMutualFriendsRequests(visibleMutualFriendsTargets, { front: true })
+      scheduleSessionMutualFriendsWorker()
+    }
+  }, [
+    collectVisibleSessionMetricTargets,
+    collectVisibleSessionMutualFriendsTargets,
+    enqueueSessionMediaMetricRequests,
+    enqueueSessionMutualFriendsRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMediaMetricWorker,
+    scheduleSessionMutualFriendsWorker
+  ])
+
+  useEffect(() => {
+    if (!isSessionCountStageReady || filteredContacts.length === 0) return
+    const runId = sessionMediaMetricRunIdRef.current
+    const visibleTargets = collectVisibleSessionMetricTargets(filteredContacts)
+    if (visibleTargets.length > 0) {
+      enqueueSessionMediaMetricRequests(visibleTargets, { front: true })
+      scheduleSessionMediaMetricWorker()
+    }
+
+    if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+      sessionMediaMetricBackgroundFeedTimerRef.current = null
+    }
+
+    const visibleTargetSet = new Set(visibleTargets)
+    let cursor = 0
+    const feedNext = () => {
+      if (runId !== sessionMediaMetricRunIdRef.current) return
+      if (isLoadingSessionCountsRef.current) return
+      const batchIds: string[] = []
+      while (cursor < filteredContacts.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
+        const contact = filteredContacts[cursor]
+        cursor += 1
+        if (!contact?.username) continue
+        if (visibleTargetSet.has(contact.username)) continue
+        const mappedSession = sessionRowByUsername.get(contact.username)
+        if (!mappedSession?.hasSession) continue
+        batchIds.push(contact.username)
+      }
+
+      if (batchIds.length > 0) {
+        enqueueSessionMediaMetricRequests(batchIds)
+        scheduleSessionMediaMetricWorker()
+      }
+
+      if (cursor < filteredContacts.length) {
+        sessionMediaMetricBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
+      }
+    }
+
+    feedNext()
+    return () => {
+      if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+        sessionMediaMetricBackgroundFeedTimerRef.current = null
+      }
+    }
+  }, [
+    collectVisibleSessionMetricTargets,
+    enqueueSessionMediaMetricRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMediaMetricWorker,
+    sessionRowByUsername
+  ])
+
+  useEffect(() => {
+    if (!isSessionCountStageReady || filteredContacts.length === 0) return
+    const runId = sessionMutualFriendsRunIdRef.current
+    const visibleTargets = collectVisibleSessionMutualFriendsTargets(filteredContacts)
+    if (visibleTargets.length > 0) {
+      enqueueSessionMutualFriendsRequests(visibleTargets, { front: true })
+      scheduleSessionMutualFriendsWorker()
+    }
+
+    if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+      window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+      sessionMutualFriendsBackgroundFeedTimerRef.current = null
+    }
+
+    const visibleTargetSet = new Set(visibleTargets)
+    let cursor = 0
+    const feedNext = () => {
+      if (runId !== sessionMutualFriendsRunIdRef.current) return
+      const batchIds: string[] = []
+      while (cursor < filteredContacts.length && batchIds.length < SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE) {
+        const contact = filteredContacts[cursor]
+        cursor += 1
+        if (!contact?.username || !isSingleContactSession(contact.username)) continue
+        if (visibleTargetSet.has(contact.username)) continue
+        const mappedSession = sessionRowByUsername.get(contact.username)
+        if (!mappedSession?.hasSession) continue
+        batchIds.push(contact.username)
+      }
+
+      if (batchIds.length > 0) {
+        enqueueSessionMutualFriendsRequests(batchIds)
+        scheduleSessionMutualFriendsWorker()
+      }
+
+      if (cursor < filteredContacts.length) {
+        sessionMutualFriendsBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
+      }
+    }
+
+    feedNext()
+    return () => {
+      if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+        sessionMutualFriendsBackgroundFeedTimerRef.current = null
+      }
+    }
+  }, [
+    collectVisibleSessionMutualFriendsTargets,
+    enqueueSessionMutualFriendsRequests,
+    filteredContacts,
+    isSessionCountStageReady,
+    scheduleSessionMutualFriendsWorker,
+    sessionRowByUsername
+  ])
+
+  useEffect(() => {
+    return () => {
+      snsUserPostCountsHydrationTokenRef.current += 1
+      if (snsUserPostCountsBatchTimerRef.current) {
+        window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+        snsUserPostCountsBatchTimerRef.current = null
+      }
+      if (sessionMediaMetricBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricBackgroundFeedTimerRef.current)
+        sessionMediaMetricBackgroundFeedTimerRef.current = null
+      }
+      if (sessionMediaMetricPersistTimerRef.current) {
+        window.clearTimeout(sessionMediaMetricPersistTimerRef.current)
+        sessionMediaMetricPersistTimerRef.current = null
+      }
+      if (sessionMutualFriendsBackgroundFeedTimerRef.current) {
+        window.clearTimeout(sessionMutualFriendsBackgroundFeedTimerRef.current)
+        sessionMutualFriendsBackgroundFeedTimerRef.current = null
+      }
+      void flushSessionMediaMetricCache()
+    }
+  }, [flushSessionMediaMetricCache])
 
   const contactByUsername = useMemo(() => {
     const map = new Map<string, ContactInfo>()
@@ -3357,6 +4961,40 @@ function ExportPage() {
       .sort((a, b) => Number(b.exportTime || 0) - Number(a.exportTime || 0))
       .slice(0, 20)
   }, [sessionDetail?.wxid, exportRecordsBySession])
+
+  const sessionDetailSupportsSnsTimeline = useMemo(() => {
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    return isSingleContactSession(sessionId)
+  }, [sessionDetail?.wxid])
+
+  const sessionDetailSnsCountLabel = useMemo(() => {
+    const sessionId = String(sessionDetail?.wxid || '').trim()
+    if (!sessionId || !sessionDetailSupportsSnsTimeline) return '朋友圈：0条'
+
+    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+      return '朋友圈：统计中...'
+    }
+    if (snsUserPostCountsStatus === 'error') {
+      return '朋友圈：统计失败'
+    }
+
+    const count = Number(snsUserPostCounts[sessionId] || 0)
+    const normalized = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0
+    return `朋友圈：${normalized}条`
+  }, [sessionDetail?.wxid, sessionDetailSupportsSnsTimeline, snsUserPostCounts, snsUserPostCountsStatus])
+
+  const sessionMutualFriendsDialogMetric = useMemo(() => {
+    const sessionId = String(sessionMutualFriendsDialogTarget?.username || '').trim()
+    if (!sessionId) return null
+    return sessionMutualFriendsMetrics[sessionId] || null
+  }, [sessionMutualFriendsDialogTarget, sessionMutualFriendsMetrics])
+
+  const filteredSessionMutualFriendsDialogItems = useMemo(() => {
+    const items = sessionMutualFriendsDialogMetric?.items || []
+    const keyword = sessionMutualFriendsSearch.trim().toLowerCase()
+    if (!keyword) return items
+    return items.filter(item => item.name.toLowerCase().includes(keyword))
+  }, [sessionMutualFriendsDialogMetric, sessionMutualFriendsSearch])
 
   const applySessionDetailStats = useCallback((
     sessionId: string,
@@ -3399,6 +5037,11 @@ function ExportPage() {
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
     if (!normalizedSessionId) return
+    const preciseCacheKey = `${exportCacheScopeRef.current}::${normalizedSessionId}`
+
+    detailStatsPriorityRef.current = true
+    sessionCountRequestIdRef.current += 1
+    setIsLoadingSessionCounts(false)
 
     const requestSeq = ++detailRequestSeqRef.current
     const mappedSession = sessionRowByUsername.get(normalizedSessionId)
@@ -3510,19 +5153,13 @@ function ExportPage() {
     }
 
     try {
-      const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
-        window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
-        window.electronAPI.chat.getExportSessionStats(
-          [normalizedSessionId],
-          { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
-        )
-      ])
-
-      if (requestSeq !== detailRequestSeqRef.current) return
-
-      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
-        const detail = extraResultSettled.value.detail
-        if (detail) {
+      const extraPromise = window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId)
+      void (async () => {
+        try {
+          const extraResult = await extraPromise
+          if (requestSeq !== detailRequestSeqRef.current) return
+          if (!extraResult.success || !extraResult.detail) return
+          const detail = extraResult.detail
           setSessionDetail((prev) => {
             if (!prev || prev.wxid !== normalizedSessionId) return prev
             return {
@@ -3532,51 +5169,73 @@ function ExportPage() {
               messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
             }
           })
+        } catch (error) {
+          console.error('导出页加载会话详情补充信息失败:', error)
+        } finally {
+          if (requestSeq === detailRequestSeqRef.current) {
+            setIsLoadingSessionDetailExtra(false)
+          }
         }
+      })()
+
+      let quickMetric: SessionExportMetric | undefined
+      let quickCacheMeta: SessionExportCacheMeta | undefined
+      try {
+        const quickStatsResult = await window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+        )
+        if (requestSeq !== detailRequestSeqRef.current) return
+        if (quickStatsResult.success) {
+          quickMetric = quickStatsResult.data?.[normalizedSessionId] as SessionExportMetric | undefined
+          quickCacheMeta = quickStatsResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+          if (quickMetric) {
+            applySessionDetailStats(normalizedSessionId, quickMetric, quickCacheMeta, false)
+          } else if (quickCacheMeta) {
+            const cacheMeta = quickCacheMeta
+            setSessionDetail((prev) => {
+              if (!prev || prev.wxid !== normalizedSessionId) return prev
+              return {
+                ...prev,
+                statsUpdatedAt: cacheMeta.updatedAt,
+                statsStale: cacheMeta.stale
+              }
+            })
+          }
+        }
+      } catch (error) {
+        console.error('导出页读取会话统计缓存失败:', error)
       }
 
-      let refreshIncludeRelations = false
-      let shouldRefreshStats = false
-      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
-        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
-        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-        refreshIncludeRelations = Boolean(cacheMeta?.includeRelations)
-        if (metric) {
-          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, refreshIncludeRelations)
-        } else if (cacheMeta) {
-          setSessionDetail((prev) => {
-            if (!prev || prev.wxid !== normalizedSessionId) return prev
-            return {
-              ...prev,
-              relationStatsLoaded: refreshIncludeRelations || prev.relationStatsLoaded,
-              statsUpdatedAt: cacheMeta.updatedAt,
-              statsStale: cacheMeta.stale
-            }
-          })
-        }
-        shouldRefreshStats = Array.isArray(statsResultSettled.value.needsRefresh) &&
-          statsResultSettled.value.needsRefresh.includes(normalizedSessionId)
-      }
+      const lastPreciseAt = sessionPreciseRefreshAtRef.current[preciseCacheKey] || 0
+      const hasRecentPrecise = Date.now() - lastPreciseAt <= DETAIL_PRECISE_REFRESH_COOLDOWN_MS
+      const shouldRunPreciseRefresh = !hasRecentPrecise && (!quickMetric || Boolean(quickCacheMeta?.stale))
 
-      if (shouldRefreshStats) {
+      if (shouldRunPreciseRefresh) {
         setIsRefreshingSessionDetailStats(true)
         void (async () => {
           try {
+            // 后台精确补算三类重字段（转账/红包/通话），不阻塞首屏基础统计显示。
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
-              { includeRelations: refreshIncludeRelations, forceRefresh: true, preferAccurateSpecialTypes: true }
+              { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
             )
             if (requestSeq !== detailRequestSeqRef.current) return
             if (freshResult.success && freshResult.data) {
               const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
               const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
               if (metric) {
-                applySessionDetailStats(
-                  normalizedSessionId,
-                  metric,
-                  cacheMeta,
-                  refreshIncludeRelations ? true : undefined
-                )
+                applySessionDetailStats(normalizedSessionId, metric, cacheMeta, false)
+                sessionPreciseRefreshAtRef.current[preciseCacheKey] = Date.now()
+              } else if (cacheMeta) {
+                setSessionDetail((prev) => {
+                  if (!prev || prev.wxid !== normalizedSessionId) return prev
+                  return {
+                    ...prev,
+                    statsUpdatedAt: cacheMeta.updatedAt,
+                    statsStale: cacheMeta.stale
+                  }
+                })
               }
             }
           } catch (error) {
@@ -3590,7 +5249,6 @@ function ExportPage() {
       }
     } catch (error) {
       console.error('导出页加载会话详情补充统计失败:', error)
-    } finally {
       if (requestSeq === detailRequestSeqRef.current) {
         setIsLoadingSessionDetailExtra(false)
       }
@@ -3619,36 +5277,6 @@ function ExportPage() {
       if (metric) {
         applySessionDetailStats(normalizedSessionId, metric, cacheMeta, true)
       }
-
-      const needRefresh = relationResult.success &&
-        Array.isArray(relationResult.needsRefresh) &&
-        relationResult.needsRefresh.includes(normalizedSessionId)
-
-      if (needRefresh) {
-        setIsRefreshingSessionDetailStats(true)
-        void (async () => {
-          try {
-            const freshResult = await window.electronAPI.chat.getExportSessionStats(
-              [normalizedSessionId],
-              { includeRelations: true, forceRefresh: true, preferAccurateSpecialTypes: true }
-            )
-            if (requestSeq !== detailRequestSeqRef.current) return
-            if (freshResult.success && freshResult.data) {
-              const freshMetric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
-              const freshMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-              if (freshMetric) {
-                applySessionDetailStats(normalizedSessionId, freshMetric, freshMeta, true)
-              }
-            }
-          } catch (error) {
-            console.error('导出页刷新会话关系统计失败:', error)
-          } finally {
-            if (requestSeq === detailRequestSeqRef.current) {
-              setIsRefreshingSessionDetailStats(false)
-            }
-          }
-        })()
-      }
     } catch (error) {
       console.error('导出页加载会话关系统计失败:', error)
     } finally {
@@ -3658,20 +5286,95 @@ function ExportPage() {
     }
   }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
 
+  useEffect(() => {
+    if (!showSessionDetailPanel || !sessionDetailSupportsSnsTimeline) return
+    if (snsUserPostCountsStatus === 'idle') {
+      void loadSnsUserPostCounts()
+    }
+  }, [
+    loadSnsUserPostCounts,
+    sessionDetailSupportsSnsTimeline,
+    showSessionDetailPanel,
+    snsUserPostCountsStatus
+  ])
+
+  useEffect(() => {
+    if (!isExportRoute || !isSessionCountStageReady) return
+    if (snsUserPostCountsStatus !== 'idle') return
+    const timer = window.setTimeout(() => {
+      void loadSnsUserPostCounts()
+    }, 260)
+    return () => window.clearTimeout(timer)
+  }, [isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (!sessionSnsTimelineTarget) return
+    if (Object.prototype.hasOwnProperty.call(snsUserPostCounts, sessionSnsTimelineTarget.username)) {
+      const total = Number(snsUserPostCounts[sessionSnsTimelineTarget.username] || 0)
+      const normalizedTotal = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0
+      setSessionSnsTimelineTotalPosts(normalizedTotal)
+      setSessionSnsRankTotalPosts(normalizedTotal)
+      setSessionSnsTimelineStatsLoading(false)
+      return
+    }
+    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+      setSessionSnsTimelineStatsLoading(true)
+      return
+    }
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsRankTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
+  }, [sessionSnsTimelineTarget, snsUserPostCounts, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (sessionSnsTimelineTotalPosts === null) return
+    if (sessionSnsTimelinePosts.length >= sessionSnsTimelineTotalPosts) {
+      setSessionSnsTimelineHasMore(false)
+    }
+  }, [sessionSnsTimelinePosts.length, sessionSnsTimelineTotalPosts])
+
+  useEffect(() => {
+    if (!sessionSnsRankMode || !sessionSnsTimelineTarget) return
+    void loadSessionSnsRankings(sessionSnsTimelineTarget)
+  }, [loadSessionSnsRankings, sessionSnsRankMode, sessionSnsTimelineTarget])
+
   const closeSessionDetailPanel = useCallback(() => {
     detailRequestSeqRef.current += 1
+    detailStatsPriorityRef.current = false
+    sessionSnsTimelineRequestTokenRef.current += 1
+    sessionSnsTimelineLoadingRef.current = false
+    sessionSnsRankRequestTokenRef.current += 1
+    sessionSnsRankLoadingRef.current = false
     setShowSessionDetailPanel(false)
     setIsLoadingSessionDetail(false)
     setIsLoadingSessionDetailExtra(false)
     setIsRefreshingSessionDetailStats(false)
     setIsLoadingSessionRelationStats(false)
+    setSessionSnsRankMode(null)
+    setSessionSnsLikeRankings([])
+    setSessionSnsCommentRankings([])
+    setSessionSnsRankLoading(false)
+    setSessionSnsRankError(null)
+    setSessionSnsRankLoadedPosts(0)
+    setSessionSnsRankTotalPosts(null)
+    setSessionSnsTimelineTarget(null)
+    setSessionSnsTimelinePosts([])
+    setSessionSnsTimelineLoading(false)
+    setSessionSnsTimelineLoadingMore(false)
+    setSessionSnsTimelineHasMore(false)
+    setSessionSnsTimelineTotalPosts(null)
+    setSessionSnsTimelineStatsLoading(false)
   }, [])
 
   const openSessionDetail = useCallback((sessionId: string) => {
     if (!sessionId) return
+    detailStatsPriorityRef.current = true
     setShowSessionDetailPanel(true)
+    if (isSingleContactSession(sessionId)) {
+      void loadSnsUserPostCounts()
+    }
     void loadSessionDetail(sessionId)
-  }, [loadSessionDetail])
+  }, [loadSessionDetail, loadSnsUserPostCounts])
 
   useEffect(() => {
     if (!showSessionDetailPanel) return
@@ -3683,6 +5386,60 @@ function ExportPage() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [closeSessionDetailPanel, showSessionDetailPanel])
+
+  useEffect(() => {
+    if (!showSessionLoadDetailModal) return
+    if (snsUserPostCountsStatus === 'idle') {
+      void loadSnsUserPostCounts()
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowSessionLoadDetailModal(false)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [loadSnsUserPostCounts, showSessionLoadDetailModal, snsUserPostCountsStatus])
+
+  useEffect(() => {
+    if (!sessionSnsTimelineTarget) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSessionSnsTimeline()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [closeSessionSnsTimeline, sessionSnsTimelineTarget])
+
+  useEffect(() => {
+    if (!sessionMutualFriendsDialogTarget) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeSessionMutualFriendsDialog()
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [closeSessionMutualFriendsDialog, sessionMutualFriendsDialogTarget])
+
+  useEffect(() => {
+    if (!showSessionFormatSelect) return
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (sessionFormatDropdownRef.current && !sessionFormatDropdownRef.current.contains(target)) {
+        setShowSessionFormatSelect(false)
+      }
+    }
+    document.addEventListener('mousedown', handlePointerDown)
+    return () => document.removeEventListener('mousedown', handlePointerDown)
+  }, [showSessionFormatSelect])
+
+  useEffect(() => {
+    if (!exportDialog.open) {
+      setShowSessionFormatSelect(false)
+    }
+  }, [exportDialog.open])
 
   const handleCopyDetailField = useCallback(async (text: string, field: string) => {
     try {
@@ -3777,10 +5534,17 @@ function ExportPage() {
   const formatCandidateOptions = exportDialog.scope === 'sns'
     ? snsFormatOptions
     : formatOptions
+  const isSessionScopeDialog = exportDialog.scope === 'single' || exportDialog.scope === 'multi'
   const isContentScopeDialog = exportDialog.scope === 'content'
   const isContentTextDialog = isContentScopeDialog && exportDialog.contentType === 'text'
+  const useCollapsedSessionFormatSelector = isSessionScopeDialog || isContentTextDialog
   const shouldShowFormatSection = !isContentScopeDialog || isContentTextDialog
   const shouldShowMediaSection = !isContentScopeDialog
+  const avatarExportStatusLabel = options.exportAvatars ? '已开启聊天消息导出带头像' : '已关闭聊天消息导出带头像'
+  const contentTextDialogSummary = '此模式只导出聊天文本，不包含图片语音视频表情包等多媒体文件。'
+  const activeDialogFormatLabel = exportDialog.scope === 'sns'
+    ? (snsFormatOptions.find(option => option.value === snsExportFormat)?.label ?? snsExportFormat)
+    : (formatOptions.find(option => option.value === options.format)?.label ?? options.format)
   const shouldShowDisplayNameSection = !(
     exportDialog.scope === 'sns' ||
     (
@@ -3797,7 +5561,33 @@ function ExportPage() {
   const isSnsCardStatsLoading = !hasSeededSnsStats
   const taskRunningCount = tasks.filter(task => task.status === 'running').length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
+  const taskCenterAlertCount = taskRunningCount + taskQueuedCount
   const hasFilteredContacts = filteredContacts.length > 0
+  const sessionLoadDetailUpdatedAt = useMemo(() => {
+    let latest = 0
+    for (const row of sessionLoadDetailRows) {
+      const candidateTimes = [
+        row.messageCount.finishedAt || row.messageCount.startedAt || 0,
+        row.mediaMetrics.finishedAt || row.mediaMetrics.startedAt || 0,
+        row.snsPostCounts.finishedAt || row.snsPostCounts.startedAt || 0,
+        row.mutualFriends.finishedAt || row.mutualFriends.startedAt || 0
+      ]
+      for (const candidate of candidateTimes) {
+        if (candidate > latest) {
+          latest = candidate
+        }
+      }
+    }
+    return latest
+  }, [sessionLoadDetailRows])
+  const isSessionLoadDetailActive = useMemo(() => (
+    sessionLoadDetailRows.some(row => (
+      row.messageCount.statusLabel.startsWith('加载中') ||
+      row.mediaMetrics.statusLabel.startsWith('加载中') ||
+      row.snsPostCounts.statusLabel.startsWith('加载中') ||
+      row.mutualFriends.statusLabel.startsWith('加载中')
+    ))
+  ), [sessionLoadDetailRows])
   const closeTaskCenter = useCallback(() => {
     setIsTaskCenterOpen(false)
     setExpandedPerfTaskId(null)
@@ -3808,18 +5598,69 @@ function ExportPage() {
   const renderContactRow = useCallback((_: number, contact: ContactInfo) => {
     const matchedSession = sessionRowByUsername.get(contact.username)
     const canExport = Boolean(matchedSession?.hasSession)
+    const isSessionBindingPending = !matchedSession && (isLoading || isSessionEnriching)
     const checked = canExport && selectedSessions.has(contact.username)
     const isRunning = canExport && runningSessionIds.has(contact.username)
     const isQueued = canExport && queuedSessionIds.has(contact.username)
-    const recent = canExport ? formatRecentExportTime(lastExportBySession[contact.username], nowTick) : ''
+    const recentExportTimestamp = lastExportBySession[contact.username]
+    const hasRecentExport = canExport && Boolean(recentExportTimestamp)
+    const recentExportTime = hasRecentExport ? formatRecentExportTime(recentExportTimestamp, nowTick) : ''
     const countedMessages = normalizeMessageCount(sessionMessageCounts[contact.username])
     const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
     const displayedMessageCount = countedMessages ?? hintedMessages
-    const messageCountLabel = !canExport
-      ? '--'
-      : typeof displayedMessageCount === 'number'
-        ? displayedMessageCount.toLocaleString('zh-CN')
-        : '获取中'
+    const mediaMetric = sessionContentMetrics[contact.username]
+    const messageCountState: { state: 'value'; text: string } | { state: 'loading' } | { state: 'na'; text: '--' } =
+      !canExport
+        ? (isSessionBindingPending ? { state: 'loading' } : { state: 'na', text: '--' })
+        : typeof displayedMessageCount === 'number'
+          ? { state: 'value', text: displayedMessageCount.toLocaleString('zh-CN') }
+          : { state: 'loading' }
+    const metricToDisplay = (value: unknown): { state: 'value'; text: string } | { state: 'loading' } | { state: 'na'; text: '--' } => {
+      const normalized = normalizeMessageCount(value)
+      if (!canExport) {
+        return isSessionBindingPending ? { state: 'loading' } : { state: 'na', text: '--' }
+      }
+      if (typeof normalized === 'number') {
+        return { state: 'value', text: normalized.toLocaleString('zh-CN') }
+      }
+      return { state: 'loading' }
+    }
+    const emojiMetric = metricToDisplay(mediaMetric?.emojiMessages)
+    const voiceMetric = metricToDisplay(mediaMetric?.voiceMessages)
+    const imageMetric = metricToDisplay(mediaMetric?.imageMessages)
+    const videoMetric = metricToDisplay(mediaMetric?.videoMessages)
+    const supportsSnsTimeline = isSingleContactSession(contact.username)
+    const hasSnsCount = Object.prototype.hasOwnProperty.call(snsUserPostCounts, contact.username)
+    const snsStageStatus = sessionLoadTraceMap[contact.username]?.snsPostCounts?.status
+    const isSnsCountLoading = (
+      supportsSnsTimeline &&
+      !hasSnsCount &&
+      (
+        snsStageStatus === 'pending' ||
+        snsStageStatus === 'loading' ||
+        snsUserPostCountsStatus === 'loading' ||
+        snsUserPostCountsStatus === 'idle'
+      )
+    )
+    const snsRawCount = Number(snsUserPostCounts[contact.username] || 0)
+    const snsCount = Number.isFinite(snsRawCount) ? Math.max(0, Math.floor(snsRawCount)) : 0
+    const mutualFriendsMetric = sessionMutualFriendsMetrics[contact.username]
+    const hasMutualFriendsMetric = Boolean(mutualFriendsMetric)
+    const mutualFriendsStageStatus = sessionLoadTraceMap[contact.username]?.mutualFriends?.status
+    const isMutualFriendsLoading = (
+      supportsSnsTimeline &&
+      canExport &&
+      !hasMutualFriendsMetric &&
+      (
+        mutualFriendsStageStatus === 'pending' ||
+        mutualFriendsStageStatus === 'loading'
+      )
+    )
+    const openChatLabel = contact.type === 'friend'
+      ? '打开私聊'
+      : contact.type === 'group'
+        ? '打开群聊'
+        : '打开对话'
     return (
       <div className={`contact-row ${checked ? 'selected' : ''}`}>
         <div className="contact-item">
@@ -3847,51 +5688,125 @@ function ExportPage() {
           </div>
           <div className="row-message-count">
             <div className="row-message-stats">
-              <strong className={`row-message-count-value ${typeof displayedMessageCount === 'number' ? '' : 'muted'}`}>
-                {messageCountLabel}
+              <strong className={`row-message-count-value ${messageCountState.state === 'value' ? '' : 'muted'}`}>
+                {messageCountState.state === 'loading'
+                  ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                  : messageCountState.text}
               </strong>
             </div>
-          </div>
-          <div className="row-action-cell">
-            <div className="row-action-main">
+            {canExport && (
               <button
-                className="row-open-chat-btn"
-                disabled={!canExport}
-                title={canExport ? '在新窗口打开该会话' : '该联系人暂无会话记录'}
+                type="button"
+                className="row-open-chat-link"
+                title="在新窗口打开该会话"
                 onClick={() => {
-                  if (!canExport) return
-                  void window.electronAPI.window.openSessionChatWindow(contact.username)
+                  void window.electronAPI.window.openSessionChatWindow(contact.username, {
+                    source: 'export',
+                    initialDisplayName: contact.displayName || contact.username,
+                    initialAvatarUrl: contact.avatarUrl,
+                    initialContactType: contact.type
+                  })
                 }}
               >
-                <ExternalLink size={13} />
-                打开对话
+                {openChatLabel}
               </button>
+            )}
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {emojiMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : emojiMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {voiceMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : voiceMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {imageMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : imageMetric.text}
+            </strong>
+          </div>
+          <div className="row-media-metric">
+            <strong className="row-media-metric-value">
+              {videoMetric.state === 'loading'
+                ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="统计加载中" />
+                : videoMetric.text}
+            </strong>
+          </div>
+          {shouldShowSnsColumn && (
+            <div className="row-media-metric">
+              {supportsSnsTimeline ? (
+                <button
+                  type="button"
+                  className={`row-sns-metric-btn ${isSnsCountLoading ? 'loading' : ''}`}
+                  title={`查看 ${contact.displayName || contact.username} 的朋友圈`}
+                  onClick={() => openContactSnsTimeline(contact)}
+                >
+                  {isSnsCountLoading
+                    ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="朋友圈统计加载中" />
+                    : hasSnsCount
+                      ? `${snsCount.toLocaleString('zh-CN')} 条`
+                      : '--'}
+                </button>
+              ) : (
+                <strong className="row-media-metric-value">--</strong>
+              )}
+            </div>
+          )}
+          {shouldShowMutualFriendsColumn && (
+            <div className="row-media-metric">
+              {supportsSnsTimeline ? (
+                <button
+                  type="button"
+                  className={`row-sns-metric-btn row-mutual-friends-btn ${isMutualFriendsLoading ? 'loading' : ''} ${hasMutualFriendsMetric ? 'ready' : ''}`}
+                  title={`查看 ${contact.displayName || contact.username} 的共同好友`}
+                  onClick={() => openSessionMutualFriendsDialog(contact)}
+                  disabled={!hasMutualFriendsMetric}
+                >
+                  {isMutualFriendsLoading
+                    ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="共同好友统计加载中" />
+                    : hasMutualFriendsMetric
+                      ? mutualFriendsMetric.count.toLocaleString('zh-CN')
+                      : '--'}
+                </button>
+              ) : (
+                <strong className="row-media-metric-value">--</strong>
+              )}
+            </div>
+          )}
+          <div className="row-action-cell">
+            <div className={`row-action-main ${hasRecentExport ? '' : 'single-line'}`.trim()}>
+              <div className={`row-export-action-stack ${hasRecentExport ? '' : 'single-line'}`.trim()}>
+                <button
+                  type="button"
+                  className={`row-export-link ${isRunning ? 'state-running' : ''} ${!canExport ? 'state-disabled' : ''}`}
+                  disabled={!canExport || isRunning}
+                  onClick={() => {
+                    if (!matchedSession || !matchedSession.hasSession) return
+                    openSingleExport({
+                      ...matchedSession,
+                      displayName: contact.displayName || matchedSession.displayName || matchedSession.username
+                    })
+                  }}
+                >
+                  {!canExport ? '暂无会话' : isRunning ? '导出中...' : isQueued ? '排队中' : '单会话导出'}
+                </button>
+                {hasRecentExport && <span className="row-export-time">{recentExportTime}</span>}
+              </div>
               <button
                 className={`row-detail-btn ${showSessionDetailPanel && sessionDetail?.wxid === contact.username ? 'active' : ''}`}
                 onClick={() => openSessionDetail(contact.username)}
               >
                 详情
               </button>
-              <button
-                className={`row-export-btn ${isRunning ? 'running' : ''} ${!canExport ? 'no-session' : ''}`}
-                disabled={!canExport || isRunning}
-                onClick={() => {
-                  if (!matchedSession || !matchedSession.hasSession) return
-                  openSingleExport({
-                    ...matchedSession,
-                    displayName: contact.displayName || matchedSession.displayName || matchedSession.username
-                  })
-                }}
-              >
-                {isRunning ? (
-                  <>
-                    <Loader2 size={14} className="spin" />
-                    导出中
-                  </>
-                ) : !canExport ? '暂无会话' : isQueued ? '排队中' : '单会话导出'}
-              </button>
             </div>
-            {recent && <span className="row-export-time">{recent}</span>}
           </div>
         </div>
       </div>
@@ -3899,15 +5814,26 @@ function ExportPage() {
   }, [
     lastExportBySession,
     nowTick,
+    openContactSnsTimeline,
     openSessionDetail,
+    openSessionMutualFriendsDialog,
     openSingleExport,
     queuedSessionIds,
     runningSessionIds,
     selectedSessions,
     sessionDetail?.wxid,
+    sessionContentMetrics,
+    sessionMutualFriendsMetrics,
+    sessionLoadTraceMap,
     sessionMessageCounts,
     sessionRowByUsername,
+    isLoading,
+    isSessionEnriching,
     showSessionDetailPanel,
+    shouldShowMutualFriendsColumn,
+    shouldShowSnsColumn,
+    snsUserPostCounts,
+    snsUserPostCountsStatus,
     toggleSelectSession
   ])
   const handleContactsListWheelCapture = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -3943,63 +5869,101 @@ function ExportPage() {
     }
   }, [])
 
+  const handleExportDefaultsChanged = useCallback((patch: ExportDefaultsSettingsPatch) => {
+    if (patch.format) {
+      setExportDefaultFormat(patch.format as TextExportFormat)
+    }
+    if (typeof patch.avatars === 'boolean') {
+      setExportDefaultAvatars(patch.avatars)
+      setOptions(prev => ({ ...prev, exportAvatars: patch.avatars! }))
+    }
+    if (patch.dateRange) {
+      setExportDefaultDateRangeSelection(patch.dateRange)
+    }
+    if (patch.media) {
+      const mediaPatch = patch.media
+      setExportDefaultMedia(mediaPatch)
+      setOptions(prev => ({
+        ...prev,
+        exportMedia: Boolean(mediaPatch.images || mediaPatch.voices || mediaPatch.videos || mediaPatch.emojis),
+        exportImages: mediaPatch.images,
+        exportVoices: mediaPatch.voices,
+        exportVideos: mediaPatch.videos,
+        exportEmojis: mediaPatch.emojis
+      }))
+    }
+    if (typeof patch.voiceAsText === 'boolean') {
+      setExportDefaultVoiceAsText(patch.voiceAsText)
+    }
+    if (typeof patch.excelCompactColumns === 'boolean') {
+      setExportDefaultExcelCompactColumns(patch.excelCompactColumns)
+    }
+    if (typeof patch.concurrency === 'number') {
+      setExportDefaultConcurrency(patch.concurrency)
+    }
+  }, [])
+
   return (
     <div className="export-board-page">
       <div className="export-top-panel">
-        <div className="global-export-controls">
-          <div className="path-control">
-            <span className="control-label">导出位置</span>
-            <div className="path-inline-row">
-              <div className="path-value">
-                <button
-                  className="path-link"
-                  type="button"
-                  title={exportFolder}
-                  onClick={() => void chooseExportFolder()}
-                >
-                  {exportFolder || '未设置'}
-                </button>
-                <button className="path-change-btn" type="button" onClick={() => void chooseExportFolder()}>
-                  更换
+        <div className="export-top-bar">
+          <div className="global-export-controls">
+            <div className="path-control">
+              <span className="control-label">导出位置</span>
+              <div className="path-inline-row">
+                <div className="path-value">
+                  <button
+                    className="path-link"
+                    type="button"
+                    title={exportFolder}
+                    onClick={() => void chooseExportFolder()}
+                  >
+                    {exportFolder || '未设置'}
+                  </button>
+                  <button className="path-change-btn" type="button" onClick={() => void chooseExportFolder()}>
+                    更换
+                  </button>
+                </div>
+                <button className="secondary-btn" onClick={() => exportFolder && void window.electronAPI.shell.openPath(exportFolder)}>
+                  <ExternalLink size={14} /> 打开
                 </button>
               </div>
-              <button className="secondary-btn" onClick={() => exportFolder && void window.electronAPI.shell.openPath(exportFolder)}>
-                <ExternalLink size={14} /> 打开
-              </button>
             </div>
-          </div>
 
-          <WriteLayoutSelector
-            writeLayout={writeLayout}
-            onChange={async (value) => {
-              setWriteLayout(value)
-              await configService.setExportWriteLayout(value)
-            }}
-            sessionNameWithTypePrefix={sessionNameWithTypePrefix}
-            onSessionNameWithTypePrefixChange={async (enabled) => {
-              setSessionNameWithTypePrefix(enabled)
-              await configService.setExportSessionNamePrefixEnabled(enabled)
-            }}
-          />
+            <WriteLayoutSelector
+              writeLayout={writeLayout}
+              onChange={async (value) => {
+                setWriteLayout(value)
+                await configService.setExportWriteLayout(value)
+              }}
+              sessionNameWithTypePrefix={sessionNameWithTypePrefix}
+              onSessionNameWithTypePrefixChange={async (enabled) => {
+                setSessionNameWithTypePrefix(enabled)
+                await configService.setExportSessionNamePrefixEnabled(enabled)
+              }}
+            />
 
-          <div className="task-center-control">
-            <span className="control-label">任务中心</span>
-            <div className="task-center-inline">
-              <div className="task-summary">
-                <span>进行中 {taskRunningCount}</span>
-                <span>排队 {taskQueuedCount}</span>
-                <span>总计 {tasks.length}</span>
-              </div>
+            <div className="more-export-settings-control">
               <button
-                className={`task-open-btn ${taskRunningCount > 0 ? 'active-running' : ''}`}
+                className="more-export-settings-btn"
                 type="button"
-                onClick={() => setIsTaskCenterOpen(true)}
+                onClick={() => setIsExportDefaultsModalOpen(true)}
               >
-                任务卡片
-                {taskRunningCount > 0 && <span className="task-running-badge">{taskRunningCount}</span>}
+                更多导出设置
               </button>
             </div>
           </div>
+
+          <button
+            className={`task-center-card ${taskCenterAlertCount > 0 ? 'has-alert' : ''}`}
+            type="button"
+            onClick={() => setIsTaskCenterOpen(true)}
+          >
+            <span className="task-center-card-label">任务中心</span>
+            {taskCenterAlertCount > 0 && (
+              <span className="task-center-card-badge">{taskCenterAlertCount}</span>
+            )}
+          </button>
         </div>
       </div>
 
@@ -4013,6 +5977,47 @@ function ExportPage() {
         onClose={closeTaskCenter}
         onTogglePerfTask={toggleTaskPerfDetail}
       />
+
+      {isExportDefaultsModalOpen && (
+        <div
+          className="export-defaults-modal-overlay"
+          onClick={() => setIsExportDefaultsModalOpen(false)}
+        >
+          <div
+            className="export-defaults-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="更多导出设置"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="export-defaults-modal-header">
+              <div>
+                <h3>更多导出设置</h3>
+              </div>
+              <button
+                className="close-icon-btn"
+                type="button"
+                onClick={() => setIsExportDefaultsModalOpen(false)}
+                aria-label="关闭更多导出设置"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="export-defaults-modal-body">
+              <ExportDefaultsSettingsForm layout="split" onDefaultsChanged={handleExportDefaultsChanged} />
+            </div>
+            <div className="export-defaults-modal-actions">
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => setIsExportDefaultsModalOpen(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="export-section-title-row">
         <h3 className="export-section-title">按类型批量导出</h3>
@@ -4033,6 +6038,7 @@ function ExportPage() {
             ? isSnsCardStatsLoading
             : false
           const isCardRunning = runningCardTypes.has(card.type)
+          const isPrimaryCard = card.type === 'text'
           return (
             <div key={card.type} className="content-card">
               <div className="card-header">
@@ -4062,7 +6068,7 @@ function ExportPage() {
                 ))}
               </div>
               <button
-                className={`card-export-btn ${isCardRunning ? 'running' : ''}`}
+                className={`card-export-btn ${isPrimaryCard ? 'primary' : 'secondary'} ${isCardRunning ? 'running' : ''}`}
                 disabled={isCardRunning}
                 onClick={() => {
                   if (card.type === 'sns') {
@@ -4094,6 +6100,18 @@ function ExportPage() {
             '你可以先在列表中筛选目标会话，再批量导出，结果会保留每个会话的结构与时间线。'
           ]}
         />
+        <button
+          className={`session-load-detail-entry ${isSessionLoadDetailActive ? 'active' : ''}`}
+          type="button"
+          onClick={() => setShowSessionLoadDetailModal(true)}
+        >
+          <span className="session-load-detail-entry-icon" aria-hidden="true">
+            <span className="session-load-detail-entry-bar" />
+            <span className="session-load-detail-entry-bar" />
+            <span className="session-load-detail-entry-bar" />
+          </span>
+          <span>数据加载详情</span>
+        </button>
       </div>
       <div className="session-table-section" ref={sessionTableSectionRef}>
         <div className="session-table-layout">
@@ -4106,9 +6124,6 @@ function ExportPage() {
                   </button>
                   <button className={`tab-btn ${activeTab === 'group' ? 'active' : ''}`} onClick={() => setActiveTab('group')}>
                     群聊 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.group}
-                  </button>
-                  <button className={`tab-btn ${activeTab === 'official' ? 'active' : ''}`} onClick={() => setActiveTab('official')}>
-                    公众号 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.official}
                   </button>
                   <button className={`tab-btn ${activeTab === 'former_friend' ? 'active' : ''}`} onClick={() => setActiveTab('former_friend')}>
                     曾经的好友 {isTabCountComputing ? <span className="count-loading">计算中<span className="animated-ellipsis" aria-hidden="true">...</span></span> : tabCounts.former_friend}
@@ -4157,9 +6172,19 @@ function ExportPage() {
                     </button>
                   </span>
                   <span className="contacts-list-header-main">
-                    <span className="contacts-list-header-main-label">联系人（头像/名称/微信号）</span>
+                    <span className="contacts-list-header-main-label">{contactsHeaderMainLabel}</span>
                   </span>
                   <span className="contacts-list-header-count">总消息数</span>
+                  <span className="contacts-list-header-media">表情包</span>
+                  <span className="contacts-list-header-media">语音</span>
+                  <span className="contacts-list-header-media">图片</span>
+                  <span className="contacts-list-header-media">视频</span>
+                  {shouldShowSnsColumn && (
+                    <span className="contacts-list-header-media">朋友圈</span>
+                  )}
+                  {shouldShowMutualFriendsColumn && (
+                    <span className="contacts-list-header-media">共同好友</span>
+                  )}
                   <span className="contacts-list-header-actions">
                     {selectedCount > 0 && (
                       <>
@@ -4237,12 +6262,275 @@ function ExportPage() {
                   data={filteredContacts}
                   computeItemKey={(_, contact) => contact.username}
                   itemContent={renderContactRow}
+                  rangeChanged={handleContactsRangeChanged}
                   atTopStateChange={setIsContactsListAtTop}
                   overscan={420}
                 />
               </div>
             )}
           </div>
+
+          {showSessionLoadDetailModal && (
+            <div
+              className="session-load-detail-overlay"
+              onClick={() => setShowSessionLoadDetailModal(false)}
+            >
+              <div
+                className="session-load-detail-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label="数据加载详情"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="session-load-detail-header">
+                  <div>
+                    <h4>数据加载详情</h4>
+                    <p>
+                      更新时间：
+                      {sessionLoadDetailUpdatedAt > 0
+                        ? new Date(sessionLoadDetailUpdatedAt).toLocaleString('zh-CN')
+                        : '暂无'}
+                    </p>
+                  </div>
+                  <button
+                    className="session-load-detail-close"
+                    type="button"
+                    onClick={() => setShowSessionLoadDetailModal(false)}
+                    aria-label="关闭"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="session-load-detail-body">
+                  <section className="session-load-detail-block">
+                    <h5>总消息数</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows.map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`messageCount:${row.tab}`]
+                        const isLoading = row.messageCount.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`message-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.messageCount.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.messageCount.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.messageCount.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>多媒体统计（表情包/图片/视频/语音）</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows.map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`mediaMetrics:${row.tab}`]
+                        const isLoading = row.mediaMetrics.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`media-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.mediaMetrics.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.mediaMetrics.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.mediaMetrics.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>朋友圈条数统计</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows
+                        .filter((row) => row.tab === 'private' || row.tab === 'former_friend')
+                        .map((row) => {
+                        const pulse = sessionLoadProgressPulseMap[`snsPostCounts:${row.tab}`]
+                        const isLoading = row.snsPostCounts.statusLabel.startsWith('加载中')
+                        return (
+                          <div className="session-load-detail-row" key={`sns-count-${row.tab}`}>
+                            <span>{row.label}</span>
+                            <span className="session-load-detail-status-cell">
+                              <span>{row.snsPostCounts.statusLabel}</span>
+                              {isLoading && (
+                                <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                              )}
+                              {isLoading && pulse && pulse.delta > 0 && (
+                                <span className="session-load-detail-progress-pulse">
+                                  {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}条
+                                </span>
+                              )}
+                            </span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.startedAt)}</span>
+                            <span>{formatLoadDetailTime(row.snsPostCounts.finishedAt)}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </section>
+
+                  <section className="session-load-detail-block">
+                    <h5>共同好友统计</h5>
+                    <div className="session-load-detail-table">
+                      <div className="session-load-detail-row header">
+                        <span>会话类型</span>
+                        <span>加载状态</span>
+                        <span>开始时间</span>
+                        <span>完成时间</span>
+                      </div>
+                      {sessionLoadDetailRows
+                        .filter((row) => row.tab === 'private' || row.tab === 'former_friend')
+                        .map((row) => {
+                          const pulse = sessionLoadProgressPulseMap[`mutualFriends:${row.tab}`]
+                          const isLoading = row.mutualFriends.statusLabel.startsWith('加载中')
+                          return (
+                            <div className="session-load-detail-row" key={`mutual-friends-${row.tab}`}>
+                              <span>{row.label}</span>
+                              <span className="session-load-detail-status-cell">
+                                <span>{row.mutualFriends.statusLabel}</span>
+                                {isLoading && (
+                                  <Loader2 size={12} className="spin session-load-detail-status-icon" aria-label="加载中" />
+                                )}
+                                {isLoading && pulse && pulse.delta > 0 && (
+                                  <span className="session-load-detail-progress-pulse">
+                                    {formatLoadDetailPulseTime(pulse.at)} +{pulse.delta}个
+                                  </span>
+                                )}
+                              </span>
+                              <span>{formatLoadDetailTime(row.mutualFriends.startedAt)}</span>
+                              <span>{formatLoadDetailTime(row.mutualFriends.finishedAt)}</span>
+                            </div>
+                          )
+                        })}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {sessionMutualFriendsDialogTarget && sessionMutualFriendsDialogMetric && (
+            <div
+              className="session-mutual-friends-overlay"
+              onClick={closeSessionMutualFriendsDialog}
+            >
+              <div
+                className="session-mutual-friends-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-label="共同好友"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="session-mutual-friends-header">
+                  <div className="session-mutual-friends-header-main">
+                    <div className="session-mutual-friends-avatar">
+                      {sessionMutualFriendsDialogTarget.avatarUrl ? (
+                        <img src={sessionMutualFriendsDialogTarget.avatarUrl} alt="" />
+                      ) : (
+                        <span>{getAvatarLetter(sessionMutualFriendsDialogTarget.displayName)}</span>
+                      )}
+                    </div>
+                    <div className="session-mutual-friends-meta">
+                      <h4>{sessionMutualFriendsDialogTarget.displayName} 的共同好友</h4>
+                      <div className="session-mutual-friends-stats">
+                        共 {sessionMutualFriendsDialogMetric.count.toLocaleString('zh-CN')} 人
+                        {sessionMutualFriendsDialogMetric.totalPosts !== null
+                          ? ` · 已统计 ${sessionMutualFriendsDialogMetric.loadedPosts.toLocaleString('zh-CN')} / ${sessionMutualFriendsDialogMetric.totalPosts.toLocaleString('zh-CN')} 条朋友圈`
+                          : ` · 已统计 ${sessionMutualFriendsDialogMetric.loadedPosts.toLocaleString('zh-CN')} 条朋友圈`}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    className="session-mutual-friends-close"
+                    type="button"
+                    onClick={closeSessionMutualFriendsDialog}
+                    aria-label="关闭共同好友弹窗"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                <div className="session-mutual-friends-tip">
+                  打开桌面端微信，进入到这个人的朋友圈中，刷ta 的朋友圈，刷的越多这里的数据聚合越多
+                </div>
+
+                <div className="session-mutual-friends-toolbar">
+                  <input
+                    value={sessionMutualFriendsSearch}
+                    onChange={(event) => setSessionMutualFriendsSearch(event.target.value)}
+                    placeholder="搜索共同好友"
+                    aria-label="搜索共同好友"
+                  />
+                </div>
+
+                <div className="session-mutual-friends-body">
+                  {filteredSessionMutualFriendsDialogItems.length === 0 ? (
+                    <div className="session-mutual-friends-empty">
+                      {sessionMutualFriendsSearch.trim() ? '没有匹配的共同好友' : '暂无共同好友数据'}
+                    </div>
+                  ) : (
+                    <div className="session-mutual-friends-list">
+                      {filteredSessionMutualFriendsDialogItems.map((item, index) => (
+                        <div className="session-mutual-friends-row" key={`${sessionMutualFriendsDialogTarget.username}-${item.name}`}>
+                          <span className="session-mutual-friends-rank">{index + 1}</span>
+                          <span className="session-mutual-friends-name" title={item.name}>{item.name}</span>
+                          <span className={`session-mutual-friends-source ${item.direction}`}>
+                            {getSessionMutualFriendDirectionLabel(item.direction)}
+                          </span>
+                          <span className="session-mutual-friends-count">{item.totalCount.toLocaleString('zh-CN')}</span>
+                          <span className="session-mutual-friends-latest">{formatYmdDateFromSeconds(item.latestTime)}</span>
+                          <span
+                            className="session-mutual-friends-desc"
+                            title={describeSessionMutualFriendRelation(item, sessionMutualFriendsDialogTarget.displayName)}
+                          >
+                            {describeSessionMutualFriendRelation(item, sessionMutualFriendsDialogTarget.displayName)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {showSessionDetailPanel && (
             <div
@@ -4315,6 +6603,21 @@ function ExportPage() {
                         <button className="copy-btn" title="复制" onClick={() => void handleCopyDetailField(sessionDetail.alias || '', 'alias')}>
                           {copiedDetailField === 'alias' ? <Check size={12} /> : <Copy size={12} />}
                         </button>
+                      </div>
+                    )}
+                    {sessionDetailSupportsSnsTimeline && (
+                      <div className="detail-item">
+                        <Aperture size={14} />
+                        <span className="label">朋友圈</span>
+                        <span className="value">
+                          <button
+                            className="detail-inline-btn detail-sns-entry-btn"
+                            type="button"
+                            onClick={openSessionSnsTimeline}
+                          >
+                            {sessionDetailSnsCountLabel}
+                          </button>
+                        </span>
                       </div>
                     )}
                   </div>
@@ -4543,6 +6846,13 @@ function ExportPage() {
               </aside>
             </div>
           )}
+
+          <ContactSnsTimelineDialog
+            target={sessionSnsTimelineTarget}
+            onClose={closeSessionSnsTimeline}
+            initialTotalPosts={sessionSnsTimelineInitialTotalPosts}
+            initialTotalPostsLoading={sessionSnsTimelineInitialTotalPostsLoading}
+          />
         </div>
       </div>
 
@@ -4550,51 +6860,97 @@ function ExportPage() {
         <div className="export-dialog-overlay" onClick={closeExportDialog}>
           <div className="export-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
             <div className="dialog-header">
-              <h3>{exportDialog.title}</h3>
+              <div className="dialog-header-copy">
+                <h3>{exportDialog.title}</h3>
+                {isContentTextDialog && (
+                  <div className="dialog-header-note">{contentTextDialogSummary}</div>
+                )}
+              </div>
               <button className="close-icon-btn" onClick={closeExportDialog}><X size={16} /></button>
             </div>
 
             <div className="dialog-body">
-              <div className="dialog-section">
-                <h4>导出范围</h4>
-                <div className="scope-tag-row">
-                  <span className="scope-tag">{scopeLabel}</span>
-                  <span className="scope-count">{scopeCountLabel}</span>
+              {exportDialog.scope !== 'single' && (
+                <div className="dialog-section">
+                  <h4>导出范围</h4>
+                  <div className="scope-tag-row">
+                    <span className="scope-tag">{scopeLabel}</span>
+                    <span className="scope-count">{scopeCountLabel}</span>
+                  </div>
+                  <div className="scope-list">
+                    {exportDialog.sessionNames.slice(0, 20).map(name => (
+                      <span key={name} className="scope-item">{name}</span>
+                    ))}
+                    {exportDialog.sessionNames.length > 20 && <span className="scope-item">... 还有 {exportDialog.sessionNames.length - 20} 个</span>}
+                  </div>
                 </div>
-                <div className="scope-list">
-                  {exportDialog.sessionNames.slice(0, 20).map(name => (
-                    <span key={name} className="scope-item">{name}</span>
-                  ))}
-                  {exportDialog.sessionNames.length > 20 && <span className="scope-item">... 还有 {exportDialog.sessionNames.length - 20} 个</span>}
-                </div>
-              </div>
+              )}
 
               {shouldShowFormatSection && (
                 <div className="dialog-section">
-                  <h4>{exportDialog.scope === 'sns' ? '朋友圈导出格式选择' : '对话文本导出格式选择'}</h4>
-                  {isContentTextDialog && (
-                    <div className="format-note">说明：此模式默认导出头像，不导出图片、语音、视频、表情包等媒体内容。</div>
+                  {useCollapsedSessionFormatSelector ? (
+                    <div className="section-header-action">
+                      <h4>对话文本导出格式选择</h4>
+                      <div className="dialog-format-select" ref={sessionFormatDropdownRef}>
+                        <button
+                          type="button"
+                          className={`time-range-trigger dialog-format-trigger ${showSessionFormatSelect ? 'open' : ''}`}
+                          onClick={() => setShowSessionFormatSelect(prev => !prev)}
+                        >
+                          <span className="dialog-format-trigger-label">{activeDialogFormatLabel}</span>
+                          <span className="time-range-arrow">&gt;</span>
+                        </button>
+                        {showSessionFormatSelect && (
+                          <div className="dialog-format-dropdown">
+                            {formatOptions.map(option => (
+                              <button
+                                key={option.value}
+                                type="button"
+                                className={`dialog-format-option ${options.format === option.value ? 'active' : ''}`}
+                                onClick={() => {
+                                  setOptions(prev => ({ ...prev, format: option.value as TextExportFormat }))
+                                  setShowSessionFormatSelect(false)
+                                }}
+                              >
+                                <span className="option-label">{option.label}</span>
+                                <span className="option-desc">{option.desc}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <h4>{exportDialog.scope === 'sns' ? '朋友圈导出格式选择' : '对话文本导出格式选择'}</h4>
                   )}
-                  <div className="format-grid">
-                    {formatCandidateOptions.map(option => (
-                      <button
-                        key={option.value}
-                        className={`format-card ${exportDialog.scope === 'sns'
-                          ? (snsExportFormat === option.value ? 'active' : '')
-                          : (options.format === option.value ? 'active' : '')}`}
-                        onClick={() => {
-                          if (exportDialog.scope === 'sns') {
-                            setSnsExportFormat(option.value as SnsTimelineExportFormat)
-                          } else {
-                            setOptions(prev => ({ ...prev, format: option.value as TextExportFormat }))
-                          }
-                        }}
-                      >
-                        <div className="format-label">{option.label}</div>
-                        <div className="format-desc">{option.desc}</div>
-                      </button>
-                    ))}
-                  </div>
+                  {!isContentScopeDialog && exportDialog.scope !== 'sns' && (
+                    <div className="format-note">{avatarExportStatusLabel}</div>
+                  )}
+                  {isContentTextDialog && (
+                    <div className="format-note">{avatarExportStatusLabel}</div>
+                  )}
+                  {!useCollapsedSessionFormatSelector && (
+                    <div className="format-grid">
+                      {formatCandidateOptions.map(option => (
+                        <button
+                          key={option.value}
+                          className={`format-card ${exportDialog.scope === 'sns'
+                            ? (snsExportFormat === option.value ? 'active' : '')
+                            : (options.format === option.value ? 'active' : '')}`}
+                          onClick={() => {
+                            if (exportDialog.scope === 'sns') {
+                              setSnsExportFormat(option.value as SnsTimelineExportFormat)
+                            } else {
+                              setOptions(prev => ({ ...prev, format: option.value as TextExportFormat }))
+                            }
+                          }}
+                        >
+                          <div className="format-label">{option.label}</div>
+                          <div className="format-desc">{option.desc}</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -4614,7 +6970,7 @@ function ExportPage() {
 
               {shouldShowMediaSection && (
                 <div className="dialog-section">
-                  <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体与头像'}</h4>
+                  <h4>{exportDialog.scope === 'sns' ? '媒体文件（可多选）' : '媒体内容'}</h4>
                   <div className="media-check-grid">
                     {exportDialog.scope === 'sns' ? (
                       <>
@@ -4628,14 +6984,32 @@ function ExportPage() {
                         <label><input type="checkbox" checked={options.exportVoices} onChange={event => setOptions(prev => ({ ...prev, exportVoices: event.target.checked }))} /> 语音</label>
                         <label><input type="checkbox" checked={options.exportVideos} onChange={event => setOptions(prev => ({ ...prev, exportVideos: event.target.checked }))} /> 视频</label>
                         <label><input type="checkbox" checked={options.exportEmojis} onChange={event => setOptions(prev => ({ ...prev, exportEmojis: event.target.checked }))} /> 表情包</label>
-                        <label><input type="checkbox" checked={options.exportVoiceAsText} onChange={event => setOptions(prev => ({ ...prev, exportVoiceAsText: event.target.checked }))} /> 语音转文字</label>
-                        <label><input type="checkbox" checked={options.exportAvatars} onChange={event => setOptions(prev => ({ ...prev, exportAvatars: event.target.checked }))} /> 导出头像</label>
                       </>
                     )}
                   </div>
                   {exportDialog.scope === 'sns' && (
                     <div className="format-note">全不勾选时仅导出文本信息，不导出媒体文件。</div>
                   )}
+                </div>
+              )}
+
+              {isSessionScopeDialog && (
+                <div className="dialog-section">
+                  <div className="dialog-switch-row">
+                    <div className="dialog-switch-copy">
+                      <h4>语音转文字</h4>
+                      <div className="format-note">默认状态跟随更多导出设置中的语音转文字开关。</div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`dialog-switch ${options.exportVoiceAsText ? 'on' : ''}`}
+                      aria-pressed={options.exportVoiceAsText}
+                      aria-label="切换语音转文字"
+                      onClick={() => setOptions(prev => ({ ...prev, exportVoiceAsText: !prev.exportVoiceAsText }))}
+                    >
+                      <span className="dialog-switch-thumb" />
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -4671,173 +7045,20 @@ function ExportPage() {
               </button>
             </div>
 
-            {isTimeRangeDialogOpen && (
-              <div className="time-range-dialog-overlay" onClick={closeTimeRangeDialog}>
-                <div className="time-range-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
-                  <div className="time-range-dialog-header">
-                    <h4>时间范围设置</h4>
-                    <button
-                      type="button"
-                      className="close-icon-btn"
-                      onClick={closeTimeRangeDialog}
-                      aria-label="关闭时间范围设置"
-                    >
-                      <X size={14} />
-                    </button>
-                  </div>
-
-                  <div className="time-range-preset-list">
-                    {([
-                      { value: 'all', label: '全部时间' },
-                      { value: 'today', label: '今天' },
-                      { value: 'yesterday', label: '昨天' },
-                      { value: 'last3days', label: '最近3天' },
-                      { value: 'last7days', label: '最近一周' },
-                      { value: 'last30days', label: '最近30 天' },
-                      { value: 'last1year', label: '最近一年' }
-                    ] as Array<{ value: Exclude<DateRangePreset, 'custom'>; label: string }>).map((preset) => {
-                      const isActive = isTimeRangePresetActive(preset.value)
-                      return (
-                        <button
-                          key={preset.value}
-                          type="button"
-                          className={`time-range-preset-item ${isActive ? 'active' : ''}`}
-                          onClick={() => handleTimeRangePresetClick(preset.value)}
-                        >
-                          <span>{preset.label}</span>
-                          {isActive && <Check size={14} />}
-                        </button>
-                      )
-                    })}
-                  </div>
-
-                  <div className={`time-range-mode-banner ${isRangeModeActive ? 'range' : 'all'}`}>
-                    {timeRangeModeText}
-                  </div>
-
-                  <div className="time-range-calendar-grid">
-                    <section className="time-range-calendar-panel">
-                      <div className="time-range-calendar-panel-header">
-                        <div className="time-range-calendar-date-label">
-                          <span>起始日期</span>
-                          <input
-                            type="text"
-                            className={`time-range-date-input ${timeRangeDateInputError.start ? 'invalid' : ''}`}
-                            value={timeRangeDateInput.start}
-                            placeholder="YYYY-MM-DD"
-                            onChange={(event) => {
-                              const nextValue = event.target.value
-                              setTimeRangeDateInput(prev => ({ ...prev, start: nextValue }))
-                              if (timeRangeDateInputError.start) {
-                                setTimeRangeDateInputError(prev => ({ ...prev, start: false }))
-                              }
-                            }}
-                            onKeyDown={(event) => {
-                              if (event.key !== 'Enter') return
-                              event.preventDefault()
-                              commitTimeRangeStartFromInput()
-                            }}
-                            onBlur={() => {
-                              commitTimeRangeStartFromInput()
-                            }}
-                          />
-                        </div>
-                        <div className="time-range-calendar-nav">
-                          <button type="button" onClick={() => shiftTimeRangePanelMonth('start', -1)} aria-label="上个月">‹</button>
-                          <span>{formatCalendarMonthTitle(activeTimeRangeDialogDraft.startPanelMonth)}</span>
-                          <button type="button" onClick={() => shiftTimeRangePanelMonth('start', 1)} aria-label="下个月">›</button>
-                        </div>
-                      </div>
-                      <div className="time-range-calendar-weekdays">
-                        {WEEKDAY_SHORT_LABELS.map(label => (
-                          <span key={`start-weekday-${label}`}>{label}</span>
-                        ))}
-                      </div>
-                      <div className="time-range-calendar-days">
-                        {startPanelCells.map((cell) => {
-                          const isSelected = !activeTimeRangeDialogDraft.useAllTime &&
-                            isSameDay(cell.date, activeTimeRangeDialogDraft.dateRange.start)
-                          return (
-                            <button
-                              key={`start-${cell.date.getTime()}`}
-                              type="button"
-                              className={`time-range-calendar-day ${cell.inCurrentMonth ? '' : 'outside'} ${isSelected ? 'selected' : ''}`}
-                              onClick={() => updateTimeRangeDraftStart(cell.date)}
-                            >
-                              {cell.date.getDate()}
-                            </button>
-                          )
-                        })}
-                      </div>
-                    </section>
-
-                    <section className="time-range-calendar-panel">
-                      <div className="time-range-calendar-panel-header">
-                        <div className="time-range-calendar-date-label">
-                          <span>截止日期</span>
-                          <input
-                            type="text"
-                            className={`time-range-date-input ${timeRangeDateInputError.end ? 'invalid' : ''}`}
-                            value={timeRangeDateInput.end}
-                            placeholder="YYYY-MM-DD"
-                            onChange={(event) => {
-                              const nextValue = event.target.value
-                              setTimeRangeDateInput(prev => ({ ...prev, end: nextValue }))
-                              if (timeRangeDateInputError.end) {
-                                setTimeRangeDateInputError(prev => ({ ...prev, end: false }))
-                              }
-                            }}
-                            onKeyDown={(event) => {
-                              if (event.key !== 'Enter') return
-                              event.preventDefault()
-                              commitTimeRangeEndFromInput()
-                            }}
-                            onBlur={() => {
-                              commitTimeRangeEndFromInput()
-                            }}
-                          />
-                        </div>
-                        <div className="time-range-calendar-nav">
-                          <button type="button" onClick={() => shiftTimeRangePanelMonth('end', -1)} aria-label="上个月">‹</button>
-                          <span>{formatCalendarMonthTitle(activeTimeRangeDialogDraft.endPanelMonth)}</span>
-                          <button type="button" onClick={() => shiftTimeRangePanelMonth('end', 1)} aria-label="下个月">›</button>
-                        </div>
-                      </div>
-                      <div className="time-range-calendar-weekdays">
-                        {WEEKDAY_SHORT_LABELS.map(label => (
-                          <span key={`end-weekday-${label}`}>{label}</span>
-                        ))}
-                      </div>
-                      <div className="time-range-calendar-days">
-                        {endPanelCells.map((cell) => {
-                          const isSelected = !activeTimeRangeDialogDraft.useAllTime &&
-                            isSameDay(cell.date, activeTimeRangeDialogDraft.dateRange.end)
-                          return (
-                            <button
-                              key={`end-${cell.date.getTime()}`}
-                              type="button"
-                              className={`time-range-calendar-day ${cell.inCurrentMonth ? '' : 'outside'} ${isSelected ? 'selected' : ''}`}
-                              onClick={() => updateTimeRangeDraftEnd(cell.date)}
-                            >
-                              {cell.date.getDate()}
-                            </button>
-                          )
-                        })}
-                      </div>
-                    </section>
-                  </div>
-
-                  <div className="time-range-dialog-actions">
-                    <button type="button" className="secondary-btn" onClick={closeTimeRangeDialog}>
-                      取消
-                    </button>
-                    <button type="button" className="primary-btn" onClick={commitTimeRangeDialogDraft}>
-                      确认
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
+            <ExportDateRangeDialog
+              open={isTimeRangeDialogOpen}
+              value={timeRangeSelection}
+              onClose={closeTimeRangeDialog}
+              onConfirm={(nextSelection) => {
+                setTimeRangeSelection(nextSelection)
+                setOptions(prev => ({
+                  ...prev,
+                  useAllTime: nextSelection.useAllTime,
+                  dateRange: cloneExportDateRange(nextSelection.dateRange)
+                }))
+                closeTimeRangeDialog()
+              }}
+            />
           </div>
         </div>,
         document.body

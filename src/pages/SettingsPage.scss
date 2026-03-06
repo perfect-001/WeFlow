@@ -348,6 +348,51 @@
     margin-bottom: 10px;
   }
 
+  .settings-time-range-field {
+    margin-bottom: 10px;
+  }
+
+  .settings-time-range-trigger {
+    width: 100%;
+    padding: 10px 16px;
+    border: 1px solid var(--border-color);
+    border-radius: 9999px;
+    font-size: 14px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+
+    &:hover {
+      border-color: rgba(var(--primary-rgb), 0.45);
+      color: var(--primary);
+    }
+
+    &.open {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent);
+    }
+  }
+
+  .settings-time-range-value {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .settings-time-range-arrow {
+    color: var(--text-tertiary);
+    font-weight: 700;
+    line-height: 1;
+  }
+
   .select-trigger {
     width: 100%;
     padding: 10px 16px;

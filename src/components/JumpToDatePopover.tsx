@@ -6,6 +6,7 @@ interface JumpToDatePopoverProps {
   isOpen: boolean
   onClose: () => void
   onSelect: (date: Date) => void
+  onMonthChange?: (date: Date) => void
   className?: string
   style?: React.CSSProperties
   currentDate?: Date
@@ -20,6 +21,7 @@ const JumpToDatePopover: React.FC<JumpToDatePopoverProps> = ({
   isOpen,
   onClose,
   onSelect,
+  onMonthChange,
   className,
   style,
   currentDate = new Date(),
@@ -112,13 +114,17 @@ const JumpToDatePopover: React.FC<JumpToDatePopoverProps> = ({
   const weekdays = ['日', '一', '二', '三', '四', '五', '六']
   const days = generateCalendar()
   const mergedClassName = ['jump-date-popover', className || ''].join(' ').trim()
+  const updateCalendarDate = (nextDate: Date) => {
+    setCalendarDate(nextDate)
+    onMonthChange?.(nextDate)
+  }
 
   return (
     <div className={mergedClassName} style={style} role="dialog" aria-label="跳转日期">
       <div className="calendar-nav">
         <button
           className="nav-btn"
-          onClick={() => setCalendarDate(new Date(calendarDate.getFullYear(), calendarDate.getMonth() - 1, 1))}
+          onClick={() => updateCalendarDate(new Date(calendarDate.getFullYear(), calendarDate.getMonth() - 1, 1))}
           aria-label="上一月"
         >
           <ChevronLeft size={16} />
@@ -126,7 +132,7 @@ const JumpToDatePopover: React.FC<JumpToDatePopoverProps> = ({
         <span className="current-month">{calendarDate.getFullYear()}年{calendarDate.getMonth() + 1}月</span>
         <button
           className="nav-btn"
-          onClick={() => setCalendarDate(new Date(calendarDate.getFullYear(), calendarDate.getMonth() + 1, 1))}
+          onClick={() => updateCalendarDate(new Date(calendarDate.getFullYear(), calendarDate.getMonth() + 1, 1))}
           aria-label="下一月"
         >
           <ChevronRight size={16} />

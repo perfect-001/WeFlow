@@ -10,6 +10,12 @@ import JumpToDatePopover from '../components/JumpToDatePopover'
 import { ExportDateRangeDialog } from '../components/Export/ExportDateRangeDialog'
 import * as configService from '../services/config'
 import {
+    finishBackgroundTask,
+    isBackgroundTaskCancelRequested,
+    registerBackgroundTask,
+    updateBackgroundTask
+} from '../services/backgroundTaskMonitor'
+import {
     createExportDateRangeSelectionFromPreset,
     getExportDateRangeLabel,
     type ExportDateRangeSelection
@@ -728,9 +734,23 @@ export default function SnsPage() {
         })
         if (pendingTargets.length === 0) return
 
+        const taskId = registerBackgroundTask({
+            sourcePage: 'sns',
+            title: '朋友圈联系人计数补算',
+            detail: `正在补算 ${pendingTargets.length} 个联系人朋友圈条数`,
+            progressText: `${preResolved}/${totalTargets}`,
+            cancelable: true
+        })
+
         let normalizedCounts: Record<string, number> = {}
         try {
             const result = await window.electronAPI.sns.getUserPostCounts()
+            if (isBackgroundTaskCancelRequested(taskId)) {
+                finishBackgroundTask(taskId, 'canceled', {
+                    detail: '已停止后续加载，当前计数查询结束后不再继续分批写入'
+                })
+                return
+            }
             if (runToken !== contactsCountHydrationTokenRef.current) return
             if (result.success && result.counts) {
                 normalizedCounts = Object.fromEntries(
@@ -747,12 +767,28 @@ export default function SnsPage() {
             }
         } catch (error) {
             console.error('Failed to load contact post counts:', error)
+            finishBackgroundTask(taskId, 'failed', {
+                detail: String(error)
+            })
+            return
         }
 
         let resolved = preResolved
         let cursor = 0
         const applyBatch = () => {
             if (runToken !== contactsCountHydrationTokenRef.current) return
+            if (isBackgroundTaskCancelRequested(taskId)) {
+                finishBackgroundTask(taskId, 'canceled', {
+                    detail: `已停止后续加载，已完成 ${resolved}/${totalTargets}`
+                })
+                contactsCountBatchTimerRef.current = null
+                setContactsCountProgress({
+                    resolved,
+                    total: totalTargets,
+                    running: false
+                })
+                return
+            }
 
             const batch = pendingTargets.slice(cursor, cursor + CONTACT_COUNT_BATCH_SIZE)
             if (batch.length === 0) {
@@ -762,6 +798,10 @@ export default function SnsPage() {
                     running: false
                 })
                 contactsCountBatchTimerRef.current = null
+                finishBackgroundTask(taskId, 'completed', {
+                    detail: '联系人朋友圈条数补算完成',
+                    progressText: `${totalTargets}/${totalTargets}`
+                })
                 return
             }
 
@@ -789,6 +829,10 @@ export default function SnsPage() {
                 total: totalTargets,
                 running: resolved < totalTargets
             })
+            updateBackgroundTask(taskId, {
+                detail: `已完成 ${resolved}/${totalTargets} 个联系人朋友圈条数补算`,
+                progressText: `${resolved}/${totalTargets}`
+            })
 
             if (cursor < totalTargets) {
                 contactsCountBatchTimerRef.current = window.setTimeout(applyBatch, CONTACT_COUNT_SORT_DEBOUNCE_MS)
@@ -803,6 +847,13 @@ export default function SnsPage() {
     // Load Contacts（先按最近会话显示联系人，再异步统计朋友圈条数并增量排序）
     const loadContacts = useCallback(async () => {
         const requestToken = ++contactsLoadTokenRef.current
+        const taskId = registerBackgroundTask({
+            sourcePage: 'sns',
+            title: '朋友圈联系人列表加载',
+            detail: '准备读取联系人缓存与最近会话',
+            progressText: '初始化',
+            cancelable: true
+        })
         stopContactsCountHydration(true)
         setContactsLoading(true)
         try {
@@ -845,10 +896,20 @@ export default function SnsPage() {
                 })
             }
 
+            updateBackgroundTask(taskId, {
+                detail: '正在读取联系人与最近会话数据',
+                progressText: '联系人快照'
+            })
             const [contactsResult, sessionsResult] = await Promise.all([
                 window.electronAPI.chat.getContacts(),
                 window.electronAPI.chat.getSessions()
             ])
+            if (isBackgroundTaskCancelRequested(taskId)) {
+                finishBackgroundTask(taskId, 'canceled', {
+                    detail: '已停止后续加载，当前联系人查询结束后未继续补齐'
+                })
+                return
+            }
             const contactMap = new Map<string, Contact>()
             const sessionTimestampMap = new Map<string, number>()
 
@@ -904,7 +965,17 @@ export default function SnsPage() {
 
             // 用 enrichSessionsContactInfo 统一补充头像和显示名
             if (allUsernames.length > 0) {
+                updateBackgroundTask(taskId, {
+                    detail: '正在补齐联系人显示名与头像',
+                    progressText: '联系人补齐'
+                })
                 const enriched = await window.electronAPI.chat.enrichSessionsContactInfo(allUsernames)
+                if (isBackgroundTaskCancelRequested(taskId)) {
+                    finishBackgroundTask(taskId, 'canceled', {
+                        detail: '已停止后续加载，联系人补齐未继续写入'
+                    })
+                    return
+                }
                 if (enriched.success && enriched.contacts) {
                     contactsList = contactsList.map((contact) => {
                         const extra = enriched.contacts?.[contact.username]
@@ -931,10 +1002,17 @@ export default function SnsPage() {
                     })
                 }
             }
+            finishBackgroundTask(taskId, 'completed', {
+                detail: `朋友圈联系人列表加载完成，共 ${contactsList.length} 人`,
+                progressText: `${contactsList.length} 人`
+            })
         } catch (error) {
             if (requestToken !== contactsLoadTokenRef.current) return
             console.error('Failed to load contacts:', error)
             stopContactsCountHydration(true)
+            finishBackgroundTask(taskId, 'failed', {
+                detail: String(error)
+            })
         } finally {
             if (requestToken === contactsLoadTokenRef.current) {
                 setContactsLoading(false)

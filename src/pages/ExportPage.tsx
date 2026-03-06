@@ -30,6 +30,7 @@ import {
 } from 'lucide-react'
 import type { ChatSession as AppChatSession, ContactInfo } from '../types/models'
 import type { ExportOptions as ElectronExportOptions, ExportProgress } from '../types/electron'
+import type { BackgroundTaskRecord } from '../types/backgroundTask'
 import * as configService from '../services/config'
 import {
   emitExportSessionStatus,
@@ -37,6 +38,11 @@ import {
   onExportSessionStatusRequest,
   onOpenSingleExport
 } from '../services/exportBridge'
+import {
+  requestCancelBackgroundTask,
+  requestCancelBackgroundTasks,
+  subscribeBackgroundTasks
+} from '../services/backgroundTaskMonitor'
 import { useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
 import { SnsPostItem } from '../components/Sns/SnsPostItem'
 import { ContactSnsTimelineDialog } from '../components/Sns/ContactSnsTimelineDialog'
@@ -174,6 +180,24 @@ const contentTypeLabels: Record<ContentType, string> = {
   image: '图片',
   video: '视频',
   emoji: '表情包'
+}
+
+const backgroundTaskSourceLabels: Record<string, string> = {
+  export: '导出页',
+  chat: '聊天页',
+  analytics: '分析页',
+  sns: '朋友圈页',
+  groupAnalytics: '群分析页',
+  annualReport: '年度报告',
+  other: '其他页面'
+}
+
+const backgroundTaskStatusLabels: Record<BackgroundTaskRecord['status'], string> = {
+  running: '运行中',
+  cancel_requested: '停止中',
+  completed: '已完成',
+  failed: '失败',
+  canceled: '已停止'
 }
 
 const conversationTabLabels: Record<ConversationTab, string> = {
@@ -1422,6 +1446,7 @@ function ExportPage() {
   const [sessionMutualFriendsMetrics, setSessionMutualFriendsMetrics] = useState<Record<string, SessionMutualFriendsMetric>>({})
   const [sessionMutualFriendsDialogTarget, setSessionMutualFriendsDialogTarget] = useState<SessionSnsTimelineTarget | null>(null)
   const [sessionMutualFriendsSearch, setSessionMutualFriendsSearch] = useState('')
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskRecord[]>([])
 
   const [exportFolder, setExportFolder] = useState('')
   const [writeLayout, setWriteLayout] = useState<configService.ExportWriteLayout>('B')
@@ -1910,6 +1935,10 @@ function ExportPage() {
     }, 500)
     return () => window.clearInterval(timer)
   }, [contactsList.length, isContactsListLoading, contactsLoadIssue])
+
+  useEffect(() => {
+    return subscribeBackgroundTasks(setBackgroundTasks)
+  }, [])
 
   useEffect(() => {
     tasksRef.current = tasks
@@ -5499,6 +5528,16 @@ function ExportPage() {
       alert('复制失败，请手动复制诊断信息')
     }
   }, [contactsDiagnosticsText])
+  const handleCancelBackgroundTask = useCallback((taskId: string) => {
+    requestCancelBackgroundTask(taskId)
+  }, [])
+  const handleCancelAllNonExportTasks = useCallback(() => {
+    requestCancelBackgroundTasks(task => (
+      task.sourcePage !== 'export' &&
+      task.cancelable &&
+      (task.status === 'running' || task.status === 'cancel_requested')
+    ))
+  }, [])
 
   const sessionContactsUpdatedAtLabel = useMemo(() => {
     if (!sessionContactsUpdatedAt) return ''
@@ -5586,6 +5625,21 @@ function ExportPage() {
   const contactsBottomScrollbarInnerStyle = useMemo<CSSProperties>(() => ({
     width: `${Math.max(contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth)}px`
   }), [contactsHorizontalScrollMetrics.contentWidth, contactsHorizontalScrollMetrics.viewportWidth])
+  const nonExportBackgroundTasks = useMemo(() => (
+    backgroundTasks.filter(task => task.sourcePage !== 'export')
+  ), [backgroundTasks])
+  const runningNonExportTaskCount = useMemo(() => (
+    nonExportBackgroundTasks.filter(task => task.status === 'running' || task.status === 'cancel_requested').length
+  ), [nonExportBackgroundTasks])
+  const cancelableNonExportTaskCount = useMemo(() => (
+    nonExportBackgroundTasks.filter(task => (
+      task.cancelable &&
+      (task.status === 'running' || task.status === 'cancel_requested')
+    )).length
+  ), [nonExportBackgroundTasks])
+  const nonExportBackgroundTasksUpdatedAt = useMemo(() => (
+    nonExportBackgroundTasks.reduce((latest, task) => Math.max(latest, task.updatedAt || 0), 0)
+  ), [nonExportBackgroundTasks])
   const sessionLoadDetailUpdatedAt = useMemo(() => {
     let latest = 0
     for (const row of sessionLoadDetailRows) {
@@ -6422,6 +6476,67 @@ function ExportPage() {
                 </div>
 
                 <div className="session-load-detail-body">
+                  <section className="session-load-detail-block">
+                    <h5>其他页面后台任务</h5>
+                    <div className="session-load-detail-summary">
+                      <div className="session-load-detail-summary-text">
+                        <strong>{runningNonExportTaskCount}</strong>
+                        <span>个任务正在占用后台读取资源</span>
+                        {nonExportBackgroundTasksUpdatedAt > 0 && (
+                          <em>最近更新时间 {new Date(nonExportBackgroundTasksUpdatedAt).toLocaleTimeString('zh-CN', { hour12: false })}</em>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="session-load-detail-stop-btn"
+                        onClick={handleCancelAllNonExportTasks}
+                        disabled={cancelableNonExportTaskCount === 0}
+                      >
+                        中断其他页面加载
+                      </button>
+                    </div>
+                    <p className="session-load-detail-note">
+                      停止请求会阻止其他页面继续发起后续统计或补算；当前已经发出的单次查询，会在返回后结束。
+                    </p>
+                    {nonExportBackgroundTasks.length > 0 ? (
+                      <div className="session-load-detail-task-list">
+                        {nonExportBackgroundTasks.map((task) => (
+                          <div key={task.id} className={`session-load-detail-task-item status-${task.status}`}>
+                            <div className="session-load-detail-task-main">
+                              <div className="session-load-detail-task-title-row">
+                                <span className="session-load-detail-task-source">
+                                  {backgroundTaskSourceLabels[task.sourcePage] || backgroundTaskSourceLabels.other}
+                                </span>
+                                <strong>{task.title}</strong>
+                                <span className={`session-load-detail-task-status status-${task.status}`}>
+                                  {backgroundTaskStatusLabels[task.status]}
+                                </span>
+                              </div>
+                              <p>{task.detail || '暂无详细说明'}</p>
+                              <div className="session-load-detail-task-meta">
+                                <span>开始：{formatLoadDetailTime(task.startedAt)}</span>
+                                <span>更新：{formatLoadDetailTime(task.updatedAt)}</span>
+                                {task.progressText && <span>进度：{task.progressText}</span>}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="session-load-detail-task-stop-btn"
+                              onClick={() => handleCancelBackgroundTask(task.id)}
+                              disabled={!task.cancelable || (task.status !== 'running' && task.status !== 'cancel_requested')}
+                            >
+                              停止
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="session-load-detail-empty">
+                        当前没有检测到其他页面后台任务
+                      </div>
+                    )}
+                  </section>
+
                   <section className="session-load-detail-block">
                     <h5>总消息数</h5>
                     <div className="session-load-detail-table">

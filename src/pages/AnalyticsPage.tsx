@@ -4,6 +4,12 @@ import { Users, Clock, MessageSquare, Send, Inbox, Calendar, Loader2, RefreshCw,
 import ReactECharts from 'echarts-for-react'
 import { useAnalyticsStore } from '../stores/analyticsStore'
 import { useThemeStore } from '../stores/themeStore'
+import {
+  finishBackgroundTask,
+  isBackgroundTaskCancelRequested,
+  registerBackgroundTask,
+  updateBackgroundTask
+} from '../services/backgroundTaskMonitor'
 import './AnalyticsPage.scss'
 import { Avatar } from '../components/Avatar'
 
@@ -48,6 +54,13 @@ function AnalyticsPage() {
 
   const loadData = useCallback(async (forceRefresh = false) => {
     if (isLoaded && !forceRefresh) return
+    const taskId = registerBackgroundTask({
+      sourcePage: 'analytics',
+      title: forceRefresh ? '刷新分析看板' : '加载分析看板',
+      detail: '准备读取整体统计数据',
+      progressText: '整体统计',
+      cancelable: true
+    })
     setIsLoading(true)
     setError(null)
     setProgress(0)
@@ -60,27 +73,70 @@ function AnalyticsPage() {
 
     try {
       setLoadingStatus('正在统计消息数据...')
+      updateBackgroundTask(taskId, {
+        detail: '正在统计消息数据',
+        progressText: '整体统计'
+      })
       const statsResult = await window.electronAPI.analytics.getOverallStatistics(forceRefresh)
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，当前页面分析流程已结束'
+        })
+        setIsLoading(false)
+        return
+      }
       if (statsResult.success && statsResult.data) {
         setStatistics(statsResult.data)
       } else {
         setError(statsResult.error || '加载统计数据失败')
+        finishBackgroundTask(taskId, 'failed', {
+          detail: statsResult.error || '加载统计数据失败'
+        })
         setIsLoading(false)
         return
       }
       setLoadingStatus('正在分析联系人排名...')
+      updateBackgroundTask(taskId, {
+        detail: '正在分析联系人排名',
+        progressText: '联系人排名'
+      })
       const rankingsResult = await window.electronAPI.analytics.getContactRankings(20)
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，联系人排名后续步骤未继续'
+        })
+        setIsLoading(false)
+        return
+      }
       if (rankingsResult.success && rankingsResult.data) {
         setRankings(rankingsResult.data)
       }
       setLoadingStatus('正在计算时间分布...')
+      updateBackgroundTask(taskId, {
+        detail: '正在计算时间分布',
+        progressText: '时间分布'
+      })
       const timeResult = await window.electronAPI.analytics.getTimeDistribution()
+      if (isBackgroundTaskCancelRequested(taskId)) {
+        finishBackgroundTask(taskId, 'canceled', {
+          detail: '已停止后续加载，时间分布结果未继续写入'
+        })
+        setIsLoading(false)
+        return
+      }
       if (timeResult.success && timeResult.data) {
         setTimeDistribution(timeResult.data)
       }
       markLoaded()
+      finishBackgroundTask(taskId, 'completed', {
+        detail: '分析看板数据加载完成',
+        progressText: '已完成'
+      })
     } catch (e) {
       setError(String(e))
+      finishBackgroundTask(taskId, 'failed', {
+        detail: String(e)
+      })
     } finally {
       setIsLoading(false)
       if (removeListener) removeListener()

@@ -13,6 +13,7 @@ export class KeyServiceMac {
   private GetDbKey: any = null
   private ScanMemoryForImageKey: any = null
   private FreeString: any = null
+  private ListWeChatProcesses: any = null
 
   private getDylibPath(): string {
     const isPackaged = app.isPackaged
@@ -54,6 +55,7 @@ export class KeyServiceMac {
       this.GetDbKey = this.lib.func('const char* GetDbKey()')
       this.ScanMemoryForImageKey = this.lib.func('const char* ScanMemoryForImageKey(int pid, const char* ciphertext)')
       this.FreeString = this.lib.func('void FreeString(const char* str)')
+      this.ListWeChatProcesses = this.lib.func('const char* ListWeChatProcesses()')
 
       this.initialized = true
     } catch (e: any) {
@@ -72,9 +74,19 @@ export class KeyServiceMac {
     try {
       onStatus?.('正在获取数据库密钥...', 0)
       
+      // 调试：列出所有 WeChat 进程
+      const procsPtr = this.ListWeChatProcesses()
+      if (procsPtr) {
+        const procs = this.koffi.decode(procsPtr, 'char', -1)
+        this.FreeString(procsPtr)
+        onStatus?.(`找到进程: ${procs}`, 0)
+      } else {
+        onStatus?.('未找到 WeChat 相关进程', 2)
+      }
+      
       const keyPtr = this.GetDbKey()
       if (!keyPtr) {
-        onStatus?.('获取失败：WeChat 未运行或无法附加', 2)
+        onStatus?.('获取失败：WeChat 未运行或无法附加（可能需要授予调试权限）', 2)
         return { success: false, error: 'WeChat 未运行或无法附加' }
       }
 

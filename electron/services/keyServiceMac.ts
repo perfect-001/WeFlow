@@ -279,7 +279,7 @@ export class KeyServiceMac {
         stdout += data
         stdoutBuf += data
         const parts = stdoutBuf.split(/\r?\n/)
-        stdoutBuf = parts.pop() || ''
+        stdoutBuf = parts.pop()!
       })
 
       child.stderr.on('data', (chunk: Buffer | string) => {
@@ -287,7 +287,7 @@ export class KeyServiceMac {
         stderr += data
         stderrBuf += data
         const parts = stderrBuf.split(/\r?\n/)
-        stderrBuf = parts.pop() || ''
+        stderrBuf = parts.pop()!
         for (const line of parts) processHelperLine(line.trim())
       })
 
@@ -358,13 +358,13 @@ export class KeyServiceMac {
       const result = await execFileAsync('osascript', scriptLines.flatMap(line => ['-e', line]), {
         timeout: waitMs + 20_000
       })
-      stdout = result.stdout || ''
+      stdout = result.stdout
     } catch (e: any) {
       const msg = `${e?.stderr || ''}\n${e?.stdout || ''}\n${e?.message || ''}`.trim()
       throw new Error(msg || 'elevated helper execution failed')
     }
 
-    const lines = String(stdout || '').split(/\r?\n/).map(x => x.trim()).filter(Boolean)
+    const lines = String(stdout).split(/\r?\n/).map(x => x.trim()).filter(Boolean)
     const last = lines[lines.length - 1]
     if (!last) throw new Error('elevated helper returned empty output')
 

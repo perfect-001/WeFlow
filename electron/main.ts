@@ -135,17 +135,33 @@ const shouldOfferUpdateForTrack = (latestVersion: string, currentVersion: string
   return false
 }
 
+let lastAppliedUpdaterChannel: string | null = null
+const resetUpdaterProviderCache = () => {
+  const updater = autoUpdater as any
+  // electron-updater 会缓存 provider；切换 channel 后需清理缓存，避免仍请求旧通道
+  for (const key of ['clientPromise', '_clientPromise', 'updateInfoAndProvider']) {
+    if (Object.prototype.hasOwnProperty.call(updater, key)) {
+      updater[key] = null
+    }
+  }
+}
+
 const applyAutoUpdateChannel = (reason: 'startup' | 'settings' = 'startup') => {
   const track = getEffectiveUpdateTrack()
   const currentTrack = inferUpdateTrackFromVersion(appVersion)
   const baseUpdateChannel = track === 'stable' ? 'latest' : track
-  autoUpdater.allowPrerelease = track !== 'stable'
-  // 只要用户当前选择的目标通道与当前安装版本所属通道不同，就允许跨通道更新（含降级）
-  autoUpdater.allowDowngrade = track !== currentTrack
-  autoUpdater.channel =
+  const nextUpdaterChannel =
     process.platform === 'win32' && process.arch === 'arm64'
       ? `${baseUpdateChannel}-arm64`
       : baseUpdateChannel
+  if (lastAppliedUpdaterChannel && lastAppliedUpdaterChannel !== nextUpdaterChannel) {
+    resetUpdaterProviderCache()
+  }
+  autoUpdater.allowPrerelease = track !== 'stable'
+  // 只要用户当前选择的目标通道与当前安装版本所属通道不同，就允许跨通道更新（含降级）
+  autoUpdater.allowDowngrade = track !== currentTrack
+  autoUpdater.channel = nextUpdaterChannel
+  lastAppliedUpdaterChannel = nextUpdaterChannel
   console.log(`[Update](${reason}) 当前版本 ${appVersion}，当前轨道: ${currentTrack}，渠道偏好: ${track}，更新通道: ${autoUpdater.channel}，allowDowngrade=${autoUpdater.allowDowngrade}`)
 }
 
@@ -1354,6 +1370,8 @@ function registerIpcHandlers() {
     if (!AUTO_UPDATE_ENABLED) {
       return { hasUpdate: false }
     }
+    // 每次主动检查前重新应用一次通道配置，确保使用最新选择的更新通道。
+    applyAutoUpdateChannel('settings')
     try {
       const result = await autoUpdater.checkForUpdates()
       if (result && result.updateInfo) {
